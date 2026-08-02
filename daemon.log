@@ -1,0 +1,25 @@
+2026-08-02 09:26:56,693 INFO daemon started home=.
+2026-08-02 09:26:56,693 INFO daemon started home=.
+2026-08-02 09:26:57,505 INFO job start id=1 kind=scene_detect priority=40 download_id=1
+2026-08-02 09:26:57,505 INFO job start id=1 kind=scene_detect priority=40 download_id=1
+2026-08-02 09:26:57,707 INFO job done id=1 kind=scene_detect
+2026-08-02 09:26:57,707 INFO job done id=1 kind=scene_detect
+2026-08-02 09:26:57,717 INFO job start id=2 kind=clip_optimize priority=30 download_id=1
+2026-08-02 09:26:57,717 INFO job start id=2 kind=clip_optimize priority=30 download_id=1
+/home/mako10k/.pyenv/versions/3.10.6/lib/python3.10/site-packages/timm/models/layers/__init__.py:48: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+2026-08-02 09:27:09,153 INFO job done id=2 kind=clip_optimize
+2026-08-02 09:27:09,153 INFO job done id=2 kind=clip_optimize
+INFO:vdl.daemon:job done id=2 kind=clip_optimize
+2026-08-02 09:27:09,162 INFO job start id=3 kind=embed priority=20 download_id=1
+2026-08-02 09:27:09,162 INFO job start id=3 kind=embed priority=20 download_id=1
+INFO:vdl.daemon:job start id=3 kind=embed priority=20 download_id=1
+2026-08-02 09:27:09,488 INFO job done id=3 kind=embed
+2026-08-02 09:27:09,488 INFO job done id=3 kind=embed
+INFO:vdl.daemon:job done id=3 kind=embed
+2026-08-02 09:27:15,174 INFO stop requested
+2026-08-02 09:27:15,174 INFO stop requested
+INFO:vdl.daemon:stop requested
+2026-08-02 09:27:15,505 INFO daemon stopped
+2026-08-02 09:27:15,505 INFO daemon stopped
+INFO:vdl.daemon:daemon stopped

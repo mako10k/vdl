@@ -1,111 +1,114 @@
-# vdl — 動画ダウンロード CLI（レジストリ付き）
+# vdl — キュー駆動の動画 DL / 索引デーモン
 
-URL を渡すと種類を判定し、**動画ファイル / HLS (`.m3u8`) / HTML ページ**を適切に処理します。  
-ダウンロード履歴はローカル SQLite レジストリに保存し、**重複ダウンロードを防ぎます**。
+URL から動画を取得し、**ローカルレジストリ**と**埋め込みベクトル索引**で管理する CLI です。
 
-設計（llmthink）: [`docs/design/vdl-architecture.dsl`](docs/design/vdl-architecture.dsl)  
-実装計画（perttool）: [`plans/vdl-mvp.pert`](plans/vdl-mvp.pert)  
-ギャップ監査: [`docs/design/gap-audit.md`](docs/design/gap-audit.md)
+重い処理はすべて **優先付きジョブキュー** に載せ、**デーモン**がバックグラウンド実行します。
 
-## 動作
+| 優先 | ジョブ | 内容 |
+|------|--------|------|
+| 100 | `download` | 動画 / m3u8 / HTML からの取得 |
+| 40 | `scene_detect` | シーン検出 (ffmpeg) |
+| 30 | `clip_optimize` | CLIP で代表キーフレーム選定 |
+| 20 | `embed` | ローカル Ollama (`nomic-embed-text`) でテキストベクトル化 |
 
-| URL の種類 | 処理 |
-|-----------|------|
-| **動画ファイル** (`.mp4` 等 / `Content-Type: video/*`) | `~/.vdl/downloads` へ直接保存。URL がレジストリにあればスキップ |
-| **インデックス** (`.m3u8`) | プレイリスト解析 → fingerprint で重複判定 → `ffmpeg` で結合 |
-| **HTML** | スクレイプして候補抽出。済/新規を表示し、番号選択でダウンロード |
-| **ローカルパス** | 動画ファイルのコピー登録、またはローカル `.m3u8` の解析・取得 |
+**ダウンロードが常に最優先**。キューが空いたら索引パイプラインを進めます。
+
+## 設計・計画
+
+| 文書 | パス |
+|------|------|
+| 初期アーキテクチャ | [`docs/design/vdl-architecture.dsl`](docs/design/vdl-architecture.dsl) |
+| キュー / 索引設計 | [`docs/design/vdl-queue-index.dsl`](docs/design/vdl-queue-index.dsl) |
+| 計画 | [`plans/vdl-queue-index.pert`](plans/vdl-queue-index.pert) |
 
 ## 必要環境
 
 - Python 3.10+
-- `ffmpeg`（m3u8 / HLS 用）
-
-## インストール
+- `ffmpeg` / `ffprobe`
+- 索引用: `torch` + `open-clip-torch`、[Ollama](https://ollama.com)（`nomic-embed-text` 推奨）
 
 ```bash
-cd /path/to/video
-pip install -e .
-# 開発・テスト
-pip install -e ".[dev]"
-pytest
+pip install -e ".[dev,index]"
+ollama pull nomic-embed-text
 ```
 
 ## 使い方
 
+### 典型フロー
+
 ```bash
-# 動画 URL をそのままダウンロード
+# 1. デーモン起動（バックグラウンド）
+vdl daemon start
+vdl daemon status
+
+# 2. URL をキューへ（すぐ戻る）
 vdl get 'https://example.com/video.mp4'
-
-# m3u8（品質: best | worst | 0 | 720 | 1080 など）
 vdl get 'https://example.com/master.m3u8' -q best
-vdl get 'https://example.com/master.m3u8' -q 720
 
-# ローカルの m3u8
-vdl get ./playlist.m3u8
+# 3. キュー監視
+vdl queue list
+vdl queue show 1
 
-# HTML ページから候補を出して対話選択
-vdl get 'https://example.com/watch/123'
-
-# 新規候補をすべて自動 DL（対話なし）
-vdl get 'https://example.com/watch/123' -y
-
-# ヘッダ付与（Referer / Cookie など）
-vdl get 'https://example.com/stream.m3u8' \
-  -H 'Referer: https://example.com/' \
-  -H 'Cookie: session=...'
-
-# 強制再ダウンロード
-vdl get 'https://example.com/video.mp4' --force
-
-# 履歴
-vdl list
-vdl list --status completed
-vdl status 'https://example.com/video.mp4'
-
-# パス確認
-vdl info
+# 4. レジストリ / 検索
+vdl registry list
+vdl registry show 1
+vdl registry search '海辺のシーン'
 ```
 
-### HTML 候補の選択入力
+### CLI マップ
 
-```
-1 3        # 1番と3番
-1-4        # 1〜4
-new        # 新規のみ
-all        # すべて（済は force なしでスキップ）
-(Enter)    # キャンセル
+| コマンド | 役割 |
+|----------|------|
+| `vdl get URL` | **download ジョブをキュー投入**（既定） |
+| `vdl get URL --sync` | 同期 DL（デバッグ用） |
+| `vdl get URL --no-index` | 索引チェーンを載せない |
+| `vdl queue list/show/cancel/retry` | キュー操作 |
+| `vdl queue reindex <download_id>` | scene→clip→embed 再投入 |
+| `vdl daemon start/stop/status/run` | デーモン |
+| `vdl registry list/status/show/search` | レジストリ・ベクトル検索 |
+
+### 同期デバッグ
+
+```bash
+vdl get 'https://example.com/a.mp4' --sync --no-index
+vdl queue reindex 1
+vdl daemon run   # フォアグラウンドで処理
 ```
 
-## データ配置
+## データ配置 (`~/.vdl` または `$VDL_HOME`)
 
 | パス | 内容 |
 |------|------|
-| `~/.vdl/downloads/` | 保存先 |
-| `~/.vdl/registry.db` | ダウンロードレジストリ (SQLite) |
-| `~/.vdl/tmp/` | 作業用 |
+| `downloads/` | 取得ファイル |
+| `registry.db` | downloads + **jobs** + **scenes** + **embeddings** メタ |
+| `chroma/` | ベクトル本体（clip / text は別コレクション） |
+| `keyframes/` | CLIP 選定キーフレーム |
+| `daemon.pid` / `daemon.log` | デーモン |
 
-環境変数 `VDL_HOME` または `vdl --home /path get ...` で変更可能です。
+## 索引パイプライン
 
-## 重複判定
+1. **シーン検出** — ffmpeg `scene` フィルタ（失敗時は固定間隔）
+2. **CLIP 最適化** — シーン内候補フレームを open_clip で埋め込み、centroid 最近傍を代表に
+3. **ローカル LLM ベクトル化** — Ollama embeddings（既定 `nomic-embed-text`）でシーン文書を embed
 
-- **動画 URL**: 正規化した URL が `status=completed` ならスキップ
-- **m3u8**: プレイリスト URL に加え、セグメント一覧から作った **fingerprint** でも照合
-- `failed` は再試行可能（重複扱いしない）
+環境変数例:
+
+```bash
+export VDL_OLLAMA_EMBED_MODEL=nomic-embed-text
+export VDL_CLIP_MODEL=ViT-B-32
+export VDL_SCENE_THRESHOLD=0.3
+```
 
 ## 非目標（MVP）
 
-- DRM / Widevine 等
-- MPEG-DASH (`.mpd`) 完全対応（検出時は明示エラー）
-- 暗号化 HLS の保証対応（警告のみ。鍵取得可能な場合のみ成功しうる）
-- ライブ窓の追従録画
-- ブラウザ自動化ログイン / GUI
-- リモート共有レジストリ
+- DRM / DASH 完全対応
+- マルチワーカー並列デーモン
+- CLIP によるテキスト→画像クロスモーダル検索（text 検索が主）
 
 ## 開発
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,index]"
 pytest
-python -m vdl get 'https://...'
+python -m vdl daemon status
 ```

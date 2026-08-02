@@ -1,0 +1,77 @@
+project VDL_QUEUE_INDEX:
+  version 1
+  title "vdl queue daemon and embedding index"
+  description |
+    Extends vdl with priority job queue, background daemon (download first),
+    and index pipeline: scene detect -> CLIP optimize -> Ollama text embed.
+  as_of 2026-08-02
+  duration_unit hour
+  finish RELEASED
+
+resource DEV:
+  title "Developer"
+  capacity 1
+
+milestone NOW:
+  title "Design finalized (vdl-queue-index)"
+  state reached
+
+milestone SCHEMA_DONE:
+  title "Jobs/scenes/embeddings schema done"
+
+milestone PIPELINE_DONE:
+  title "Index pipeline stages done"
+
+milestone DAEMON_DONE:
+  title "Daemon worker done"
+
+milestone CLI_DONE:
+  title "CLI queue/daemon/registry done"
+
+milestone TESTS_DONE:
+  title "Tests green"
+
+milestone RELEASED:
+  title "Feature accepted"
+
+task SCHEMA NOW -> SCHEMA_DONE:
+  title "Implement jobs queue and registry index tables"
+  duration 2h
+  priority 100
+  requires:
+    DEV 1
+
+task PIPELINE SCHEMA_DONE -> PIPELINE_DONE:
+  title "Scene detect, CLIP optimize, Ollama embed + Chroma"
+  duration 4h
+  priority 90
+  requires:
+    DEV 1
+
+task DAEMON PIPELINE_DONE -> DAEMON_DONE:
+  title "Daemon loop with download priority"
+  duration 2h
+  priority 80
+  requires:
+    DEV 1
+
+task CLI DAEMON_DONE -> CLI_DONE:
+  title "CLI: get enqueue, queue, daemon, registry search"
+  duration 2h
+  priority 70
+  requires:
+    DEV 1
+
+task TESTS CLI_DONE -> TESTS_DONE:
+  title "Unit and integration tests"
+  duration 2h
+  priority 60
+  requires:
+    DEV 1
+
+task DOCS TESTS_DONE -> RELEASED:
+  title "README and design index update"
+  duration 1h
+  priority 50
+  requires:
+    DEV 1

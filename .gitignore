@@ -9,6 +9,8 @@ venv/
 .env
 *.db
 .vdl/
+keyframes/
+chroma/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
