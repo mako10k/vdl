@@ -271,6 +271,19 @@ def classify_media_url(
     # Explicit media extensions win over wrong MIME (e.g. type=image/jpeg on .mp4)
     if ext in _MEDIA_INDEX_EXT:
         return "index"
+    # HLS/DASH segments are never candidates (align with Chrome extension)
+    if ext in {".m4s", ".m4f"}:
+        return None
+    if ext == ".ts":
+        path_l0 = (urlparse(url).path or "").lower()
+        if re.search(
+            r"(?:seg(?:ment)?|chunk|media|part|init)[_-]?\d+",
+            path_l0,
+            re.I,
+        ):
+            return None
+        # rare standalone .ts file → video
+        return "video"
     if ext in _MEDIA_VIDEO_EXT:
         return "video"
 

@@ -91,14 +91,23 @@ async function enqueueUrl(url, { quality } = {}) {
   if (!url || !/^https?:\/\//i.test(url)) {
     throw new Error(`http(s) URL のみ対応: ${url || '(empty)'}`);
   }
-  // dash not supported by backend — still try enqueue so user sees error, or filter
   const settings = await getSettings();
   const q = quality || settings.quality || 'best';
-  const r = await api.enqueue({ url, quality: q });
-  const jobId = r?.job?.id;
-  const started = r?.runtime?.started ? ' (worker started)' : '';
-  notify('vdl queued', `job #${jobId} · ${url.slice(0, 80)}${started}`);
-  return r;
+  try {
+    const r = await api.enqueue({ url, quality: q });
+    const jobId = r?.job?.id;
+    const started = r?.runtime?.started ? ' (worker started)' : '';
+    notify('vdl queued', `job #${jobId} · ${url.slice(0, 80)}${started}`);
+    return r;
+  } catch (e) {
+    const msg = e.message || String(e);
+    if (msg.includes('HTML') || msg.includes('candidates')) {
+      throw new Error(
+        'HTML ページです。右クリック「候補を抽出」または検出→Console を使ってください',
+      );
+    }
+    throw e;
+  }
 }
 
 async function openConsoleWithMedia(tabId, pageUrl, { tab = 'candidates' } = {}) {
@@ -138,7 +147,7 @@ chrome.runtime.onInstalled.addListener(() => {
     });
     chrome.contextMenus.create({
       id: MENU.PAGE,
-      title: 'vdl: このページ URL を Enqueue',
+      title: 'vdl: このページの候補を Console へ',
       contexts: ['page'],
     });
     chrome.contextMenus.create({
@@ -197,7 +206,51 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   try {
     const tabId = tab?.id;
     if (info.menuItemId === MENU.PAGE) {
-      await enqueueUrl(tab?.url || info.pageUrl);
+      const url = tab?.url || info.pageUrl;
+      if (tabId != null) {
+        try {
+          const res = await chrome.tabs.sendMessage(tabId, { type: 'rescan' });
+          if (res?.items) addMediaItems(tabId, res.items, res.pageUrl || url);
+        } catch {
+          /* ignore */
+        }
+        if (listTabMedia(tabId).length) {
+          const r = await openConsoleWithMedia(tabId, url, { tab: 'candidates' });
+          notify('vdl', `検出 ${r.count} 件 → Console`);
+          return;
+        }
+      }
+      if (url) {
+        const r = await api.candidates(url);
+        const n = r.count ?? (r.candidates || []).length;
+        await chrome.storage.session.set({
+          lastCandidates: {
+            page_url: r.page_url || url,
+            candidates: r.candidates || [],
+            at: Date.now(),
+          },
+        });
+        if (n) {
+          const settings = await getSettings();
+          const push = await api.bridgePush({
+            page_url: r.page_url || url,
+            items: (r.candidates || []).map((c) => ({
+              url: c.url,
+              kind: c.kind,
+              source: c.source || 'scrape',
+              title: c.title,
+            })),
+            tab: 'candidates',
+            note: 'page menu scrape',
+          });
+          await chrome.tabs.create({
+            url: `${settings.uiBase}/?${push.ui_query || `vdl_bridge=${push.token}&tab=candidates`}`,
+          });
+          notify('vdl candidates', `${n} 件 → Console`);
+        } else {
+          notify('vdl', '候補なし — 再生してから再検出');
+        }
+      }
       return;
     }
     if (info.menuItemId === MENU.LINK) {

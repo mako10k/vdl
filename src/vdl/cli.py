@@ -868,6 +868,8 @@ def queue_retry(ctx: click.Context, job_id: int) -> None:
         console.print(f"[red]job {job_id} not found[/red]")
         sys.exit(1)
     console.print(f"retry job_id={job.id} status={job.status}")
+    if job.status == "pending":
+        _auto_start_daemon(config)
 
 
 @queue_group.command("reindex")

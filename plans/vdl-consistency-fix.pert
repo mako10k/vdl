@@ -1,0 +1,202 @@
+project VDL_CONSISTENCY_FIX:
+  version 1
+  title "vdl consistency — review P0/P1/P2 fixes"
+  description |
+    Implements findings from the completeness/consistency/symmetry review:
+    (1) HTML enqueue non-interactive + surface parity,
+    (2) archive vs dependency claim/orphan symmetry,
+    (3) housekeep retry semantics,
+    then P1 operator parity (CLI retry runtime, classify segment/ts,
+    Web force/search/retry, list windows) and P2 tests/docs.
+  as_of 2026-08-02
+  duration_unit hour
+  finish RELEASED
+
+resource DEV:
+  title "Developer"
+  capacity 1
+
+# ---------------------------------------------------------------------------
+# Milestones
+# ---------------------------------------------------------------------------
+
+milestone NOW:
+  title "Review baselined (網羅性・一貫性・対称性)"
+  state reached
+
+milestone P0_HTML_DONE:
+  title "HTML enqueue non-interactive + surface parity"
+  state reached
+
+milestone P0_ARCHIVE_DONE:
+  title "Archive and dependency claim/orphan fixed"
+  state reached
+
+milestone P0_HOUSEKEEP_DONE:
+  title "Housekeep retry semantics clarified/fixed"
+  state reached
+
+milestone P1_CORE_DONE:
+  title "P1 core: classify ts + CLI retry ensure_runtime"
+  state reached
+
+milestone P1_WEB_DONE:
+  title "P1 Web: force/no_index, cancelled retry, search toggles, job error"
+  state reached
+
+milestone QUALITY_DONE:
+  title "Tests green for new behaviors"
+  state reached
+
+milestone RELEASED:
+  title "Consistency fixes accepted and documented"
+  state reached
+
+# ---------------------------------------------------------------------------
+# P0 — correctness / stuck work / HTML symmetry
+# ---------------------------------------------------------------------------
+
+task HTML_WORKER_NONINTERACTIVE NOW -> P0_HTML_DONE:
+  title "Worker HTML path never prompts; non-TTY safe"
+  description |
+    service._handle_html / select_candidate_indices: when not interactive
+    (daemon worker), never console.input; use auto_yes/new-only or list_only
+    from job payload. Empty selection = listed/skipped without hang.
+  duration 1h
+  status done
+  priority 100
+  requires:
+    DEV 1
+
+task HTML_API_SURFACE NOW -> P0_HTML_DONE:
+  title "API enqueue: HTML/unknown routes to candidates semantics"
+  description |
+    POST /api/enqueue: probe kind; if HTML/unknown either return 400 with
+    candidates hint or enqueue as list_only + structured result (no silent fail).
+    Align batch similarly for page URLs when detected.
+  duration 1h
+  status done
+  priority 95
+  requires:
+    DEV 1
+
+task HTML_WEB_EXT NOW -> P0_HTML_DONE:
+  title "Web Get + extension: page URLs use scrape/detect not blind enqueue"
+  description |
+    Web: enqueue path probes or refuses HTML with message to Candidates.
+    Extension: context menu page enqueue uses candidates/bridge not download job
+    for HTML pages; document detect→Console flow.
+  duration 1h
+  status done
+  priority 90
+  requires:
+    DEV 1
+
+# ---------------------------------------------------------------------------
+# P0 — archive × dependency
+# ---------------------------------------------------------------------------
+
+task ARCHIVE_DEPENDENCY P0_HTML_DONE -> P0_ARCHIVE_DONE:
+  title "Do not archive parents with live dependents; claim/orphan archived"
+  description |
+    housekeep: skip archive if pending/running children depend on job.
+    claim_next: treat parent archived-after-success as satisfied (or only
+    archive when no dependents). cancel_orphaned: include parent archived
+    from failed/cancelled lineage. Tests for stuck-child regression.
+  duration 2h
+  status done
+  priority 100
+  requires:
+    DEV 1
+
+# ---------------------------------------------------------------------------
+# P0 — housekeep retry semantics
+# ---------------------------------------------------------------------------
+
+task HOUSEKEEP_RETRY_SEMANTICS P0_ARCHIVE_DONE -> P0_HOUSEKEEP_DONE:
+  title "Housekeep grants one extra attempt, not full attempts reset"
+  description |
+    Replace full retry() reset with controlled requeue: attempts stays
+    or +1 single shot; honor max_attempts; set housekeep_retried; docs/stats
+    match behavior. Wire max_attempts param to actual gate.
+  duration 1h
+  status done
+  priority 95
+  requires:
+    DEV 1
+
+# ---------------------------------------------------------------------------
+# P1 — core operator parity
+# ---------------------------------------------------------------------------
+
+task CLASSIFY_TS_SEGMENT P0_HOUSEKEEP_DONE -> P1_CORE_DONE:
+  title "Align .ts/.m4s segment rejection scraper ↔ extension"
+  description |
+    Reject typical HLS/DASH segment .ts/.m4s in classify_media_url;
+    keep standalone .ts rare case optional; unit tests.
+  duration 1h
+  status done
+  priority 80
+  requires:
+    DEV 1
+
+task CLI_RETRY_RUNTIME P0_HOUSEKEEP_DONE -> P1_CORE_DONE:
+  title "CLI queue retry/reindex ensure runtime like API"
+  description |
+    After queue retry and reindex, call ensure_runtime / _auto_start_daemon.
+  duration 0.5h
+  status done
+  priority 75
+  requires:
+    DEV 1
+
+# ---------------------------------------------------------------------------
+# P1 — Web surface
+# ---------------------------------------------------------------------------
+
+task WEB_ENQUEUE_OPTS P1_CORE_DONE -> P1_WEB_DONE:
+  title "Web force / no_index + skip known unless force"
+  description |
+    Get/Candidates: force and no_index checkboxes; batch skip known
+    unless force (match CLI).
+  duration 1h
+  status done
+  priority 70
+  requires:
+    DEV 1
+
+task WEB_QUEUE_SEARCH P1_CORE_DONE -> P1_WEB_DONE:
+  title "Web queue error/cancelled retry; search modality/by_scene"
+  description |
+    Queue table: show error snippet; retry for failed+cancelled.
+    Search: modality clip|text, by_scene toggle, optional scene for similar.
+  duration 1.5h
+  status done
+  priority 65
+  requires:
+    DEV 1
+
+# ---------------------------------------------------------------------------
+# Quality + docs
+# ---------------------------------------------------------------------------
+
+task TESTS_CONSISTENCY P1_WEB_DONE -> QUALITY_DONE:
+  title "Tests: HTML non-interactive, archive deps, housekeep attempt, ts reject"
+  description |
+    Add/adjust unit tests; run full pytest green.
+  duration 1.5h
+  status done
+  priority 60
+  requires:
+    DEV 1
+
+task DOCS_ENV_README QUALITY_DONE -> RELEASED:
+  title "README env catalog + reindex path note + multi-worker wording"
+  description |
+    Document list/archive/housekeep knobs; fix multi-worker non-goal wording;
+    note CLI queue reindex vs API registry reindex.
+  duration 0.5h
+  status done
+  priority 50
+  requires:
+    DEV 1

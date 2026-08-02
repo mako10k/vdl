@@ -73,6 +73,14 @@ def test_classify_media_url_strict() -> None:
     assert classify_media_url("https://x/a.mp4", mime="image/jpeg") == "video"
 
 
+def test_rejects_hls_segment_ts() -> None:
+    assert classify_media_url("https://cdn.example.com/seg0001.ts") is None
+    assert classify_media_url("https://cdn.example.com/chunk_12.ts") is None
+    assert classify_media_url("https://cdn.example.com/x.m4s") is None
+    # rare standalone .ts may still count as video
+    assert classify_media_url("https://cdn.example.com/movie.ts") == "video"
+
+
 def test_rejects_image_source_with_video_type() -> None:
     html = """
     <video poster="https://cdn.example.com/p.jpg" src="https://cdn.example.com/ok.mp4">

@@ -291,7 +291,11 @@ export default function App() {
 
   const [url, setUrl] = useState('')
   const [quality, setQuality] = useState('best')
+  const [force, setForce] = useState(false)
+  const [noIndex, setNoIndex] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [searchByScene, setSearchByScene] = useState(false)
+  const [searchModality, setSearchModality] = useState<'clip' | 'text'>('clip')
 
   const [jobs, setJobs] = useState<Job[]>([])
   const [allDone, setAllDone] = useState(false)
@@ -449,7 +453,12 @@ export default function App() {
     if (!url.trim()) return
     setBusy(true)
     try {
-      const r = await api.enqueue({ url: url.trim(), quality })
+      const r = await api.enqueue({
+        url: url.trim(),
+        quality,
+        force,
+        no_index: noIndex,
+      })
       setMsg(
         `queued job #${r.job.id} · ${r.runtime.role} pid=${r.runtime.pid}${
           r.runtime.started ? ' (started)' : ''
@@ -458,7 +467,16 @@ export default function App() {
       setTab('queue')
       await refreshQueue()
     } catch (e) {
-      setErr(String(e))
+      const msg = String(e)
+      // HTML pages must go through Candidates (API 400 + hint)
+      if (msg.includes('candidates') || msg.includes('HTML page')) {
+        setCandUrl(url.trim())
+        setMsg('HTML ページです → Candidates で候補抽出してください')
+        setTab('candidates')
+        setErr(null)
+      } else {
+        setErr(msg)
+      }
     } finally {
       setBusy(false)
     }
@@ -500,14 +518,22 @@ export default function App() {
     setMsg(null)
     const urls = candidates
       .filter((c) => selected.has(c.index))
+      .filter((c) => force || c.selected_by_default || (!c.known && !c.downloaded && !c.queued))
       .map((c) => c.url)
     if (!urls.length) {
-      setErr('候補が選択されていません')
+      setErr(
+        force
+          ? '候補が選択されていません'
+          : '新規候補がありません（force で既知も再投入可）',
+      )
       return
     }
     setBusy(true)
     try {
-      const r = await api.enqueueBatch(urls)
+      const r = await api.enqueueBatch(urls, {
+        force,
+        no_index: noIndex,
+      })
       setMsg(`enqueued ${r.jobs.length} job(s)`)
       setTab('queue')
       await refreshQueue()
@@ -524,9 +550,11 @@ export default function App() {
     if (!searchQ.trim()) return
     setBusy(true)
     try {
-      const r = await api.searchText(searchQ.trim())
+      const r = await api.searchText(searchQ.trim(), 8, searchByScene)
       setHits(r.hits)
-      setSearchTitle(`text: ${searchQ.trim()}`)
+      setSearchTitle(
+        `text: ${searchQ.trim()}${searchByScene ? ' [by scene]' : ''}`,
+      )
     } catch (e) {
       setErr(String(e))
     } finally {
@@ -544,9 +572,9 @@ export default function App() {
     }
     setBusy(true)
     try {
-      const r = await api.searchSimilar(id, 'clip')
+      const r = await api.searchSimilar(id, searchModality, 8)
       setHits(r.hits)
-      setSearchTitle(`similar to dl=${id} [clip]`)
+      setSearchTitle(`similar to dl=${id} [${searchModality}]`)
     } catch (e) {
       setErr(String(e))
     } finally {
@@ -629,6 +657,22 @@ export default function App() {
               <option value="720">720</option>
               <option value="1080">1080</option>
             </select>
+            <label className="muted">
+              <input
+                type="checkbox"
+                checked={force}
+                onChange={(e) => setForce(e.target.checked)}
+              />{' '}
+              force
+            </label>
+            <label className="muted">
+              <input
+                type="checkbox"
+                checked={noIndex}
+                onChange={(e) => setNoIndex(e.target.checked)}
+              />{' '}
+              no-index
+            </label>
             <button className="btn" type="button" disabled={busy} onClick={onEnqueue}>
               Enqueue
             </button>
@@ -768,10 +812,19 @@ export default function App() {
                     <td>
                       <JobStatus s={j.status} />
                     </td>
-                    <td className="progress">{j.progress_label}</td>
+                    <td className="progress">
+                      {j.progress_label}
+                      {j.error && (
+                        <div className="muted" style={{ fontSize: '0.75rem' }}>
+                          {j.error.slice(0, 80)}
+                        </div>
+                      )}
+                    </td>
                     <td>{j.download_id ?? '—'}</td>
                     <td>
-                      {j.status === 'failed' && (
+                      {(j.status === 'failed' ||
+                        j.status === 'cancelled' ||
+                        j.status === 'archived') && (
                         <button
                           className="btn secondary"
                           type="button"
@@ -1114,6 +1167,14 @@ export default function App() {
               onChange={(e) => setSearchQ(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && onSearchText()}
             />
+            <label className="muted">
+              <input
+                type="checkbox"
+                checked={searchByScene}
+                onChange={(e) => setSearchByScene(e.target.checked)}
+              />{' '}
+              by scene
+            </label>
             <button className="btn" type="button" disabled={busy} onClick={onSearchText}>
               Text search
             </button>
@@ -1126,8 +1187,15 @@ export default function App() {
               onChange={(e) => setSimilarId(e.target.value)}
               style={{ width: 120 }}
             />
+            <select
+              value={searchModality}
+              onChange={(e) => setSearchModality(e.target.value as 'clip' | 'text')}
+            >
+              <option value="clip">clip</option>
+              <option value="text">text</option>
+            </select>
             <button className="btn" type="button" disabled={busy} onClick={onSearchSimilar}>
-              Similar (CLIP)
+              Similar
             </button>
           </div>
           {searchTitle && <p className="muted">{searchTitle}</p>}

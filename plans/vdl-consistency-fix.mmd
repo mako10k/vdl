@@ -1,0 +1,58 @@
+flowchart LR
+  %% perttool:profile {"schema_version":"Perttool.MermaidProfile.v1","profile":"perttool","source_fidelity":"semantic-v1","record_count":21,"metadata_digest":"sha256:fbbec3ecd2b67b354359c11dd4329057587f5cf6992e8be0faee8720fdffae5a","projection_digest":"sha256:7a026cee81fc29ddcea3ad6215c8883f96f706d215e91974c4e171bf0fbf56ea","projection":{"schema_version":"Perttool.MermaidProjection.v1","direction":"LR","analysis":"none","capacity_overrides":[]}}
+  %% perttool:project {"id":"VDL_CONSISTENCY_FIX","version":1,"title":"vdl consistency — review P0/P1/P2 fixes","description":"Implements findings from the completeness/consistency/symmetry review:\n(1) HTML enqueue non-interactive + surface parity,\n(2) archive vs dependency claim/orphan symmetry,\n(3) housekeep retry semantics,\nthen P1 operator parity (CLI retry runtime, classify segment/ts,\nWeb force/search/retry, list windows) and P2 tests/docs.","as_of":"2026-08-02","duration_unit":"hour","velocity":null,"finish":"RELEASED","critical_epsilon":"0h","target_duration":null}
+  %% perttool:resource {"id":"DEV","title":"Developer","description":null,"capacity":1,"tags":[]}
+  %% perttool:milestone {"id":"NOW","title":"Review baselined (網羅性・一貫性・対称性)","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"P0_ARCHIVE_DONE","title":"Archive and dependency claim/orphan fixed","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"P0_HOUSEKEEP_DONE","title":"Housekeep retry semantics clarified/fixed","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"P0_HTML_DONE","title":"HTML enqueue non-interactive + surface parity","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"P1_CORE_DONE","title":"P1 core: classify ts + CLI retry ensure_runtime","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"P1_WEB_DONE","title":"P1 Web: force/no_index, cancelled retry, search toggles, job error","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"QUALITY_DONE","title":"Tests green for new behaviors","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"RELEASED","title":"Consistency fixes accepted and documented","description":null,"state":"reached","tags":[]}
+  %% perttool:task {"id":"ARCHIVE_DEPENDENCY","from":"P0_HTML_DONE","to":"P0_ARCHIVE_DONE","title":"Do not archive parents with live dependents; claim/orphan archived","description":"housekeep: skip archive if pending/running children depend on job.\nclaim_next: treat parent archived-after-success as satisfied (or only\narchive when no dependents). cancel_orphaned: include parent archived\nfrom failed/cancelled lineage. Tests for stuck-child regression.","estimate":{"kind":"deterministic","duration":"2h"},"status":"done","priority":100,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"CLASSIFY_TS_SEGMENT","from":"P0_HOUSEKEEP_DONE","to":"P1_CORE_DONE","title":"Align .ts/.m4s segment rejection scraper ↔ extension","description":"Reject typical HLS/DASH segment .ts/.m4s in classify_media_url;\nkeep standalone .ts rare case optional; unit tests.","estimate":{"kind":"deterministic","duration":"1h"},"status":"done","priority":80,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"CLI_RETRY_RUNTIME","from":"P0_HOUSEKEEP_DONE","to":"P1_CORE_DONE","title":"CLI queue retry/reindex ensure runtime like API","description":"After queue retry and reindex, call ensure_runtime / _auto_start_daemon.","estimate":{"kind":"deterministic","duration":"0.5h"},"status":"done","priority":75,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"DOCS_ENV_README","from":"QUALITY_DONE","to":"RELEASED","title":"README env catalog + reindex path note + multi-worker wording","description":"Document list/archive/housekeep knobs; fix multi-worker non-goal wording;\nnote CLI queue reindex vs API registry reindex.","estimate":{"kind":"deterministic","duration":"0.5h"},"status":"done","priority":50,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"HOUSEKEEP_RETRY_SEMANTICS","from":"P0_ARCHIVE_DONE","to":"P0_HOUSEKEEP_DONE","title":"Housekeep grants one extra attempt, not full attempts reset","description":"Replace full retry() reset with controlled requeue: attempts stays\nor +1 single shot; honor max_attempts; set housekeep_retried; docs/stats\nmatch behavior. Wire max_attempts param to actual gate.","estimate":{"kind":"deterministic","duration":"1h"},"status":"done","priority":95,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"HTML_API_SURFACE","from":"NOW","to":"P0_HTML_DONE","title":"API enqueue: HTML/unknown routes to candidates semantics","description":"POST /api/enqueue: probe kind; if HTML/unknown either return 400 with\ncandidates hint or enqueue as list_only + structured result (no silent fail).\nAlign batch similarly for page URLs when detected.","estimate":{"kind":"deterministic","duration":"1h"},"status":"done","priority":95,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"HTML_WEB_EXT","from":"NOW","to":"P0_HTML_DONE","title":"Web Get + extension: page URLs use scrape/detect not blind enqueue","description":"Web: enqueue path probes or refuses HTML with message to Candidates.\nExtension: context menu page enqueue uses candidates/bridge not download job\nfor HTML pages; document detect→Console flow.","estimate":{"kind":"deterministic","duration":"1h"},"status":"done","priority":90,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"HTML_WORKER_NONINTERACTIVE","from":"NOW","to":"P0_HTML_DONE","title":"Worker HTML path never prompts; non-TTY safe","description":"service._handle_html / select_candidate_indices: when not interactive\n(daemon worker), never console.input; use auto_yes/new-only or list_only\nfrom job payload. Empty selection = listed/skipped without hang.","estimate":{"kind":"deterministic","duration":"1h"},"status":"done","priority":100,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"TESTS_CONSISTENCY","from":"P1_WEB_DONE","to":"QUALITY_DONE","title":"Tests: HTML non-interactive, archive deps, housekeep attempt, ts reject","description":"Add/adjust unit tests; run full pytest green.","estimate":{"kind":"deterministic","duration":"1.5h"},"status":"done","priority":60,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"WEB_ENQUEUE_OPTS","from":"P1_CORE_DONE","to":"P1_WEB_DONE","title":"Web force / no_index + skip known unless force","description":"Get/Candidates: force and no_index checkboxes; batch skip known\nunless force (match CLI).","estimate":{"kind":"deterministic","duration":"1h"},"status":"done","priority":70,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"WEB_QUEUE_SEARCH","from":"P1_CORE_DONE","to":"P1_WEB_DONE","title":"Web queue error/cancelled retry; search modality/by_scene","description":"Queue table: show error snippet; retry for failed+cancelled.\nSearch: modality clip|text, by_scene toggle, optional scene for similar.","estimate":{"kind":"deterministic","duration":"1.5h"},"status":"done","priority":65,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:projection-begin
+  ptm_NOW(("NOW: Review baselined (網羅性・一貫性・対称性)"))
+  ptm_P0_ARCHIVE_DONE(("P0_ARCHIVE_DONE: Archive and dependency claim/orphan fixed"))
+  ptm_P0_HOUSEKEEP_DONE(("P0_HOUSEKEEP_DONE: Housekeep retry semantics clarified/fixed"))
+  ptm_P0_HTML_DONE(("P0_HTML_DONE: HTML enqueue non-interactive + surface parity"))
+  ptm_P1_CORE_DONE(("P1_CORE_DONE: P1 core: classify ts + CLI retry ensure_runtime"))
+  ptm_P1_WEB_DONE(("P1_WEB_DONE: P1 Web: force/no_index, cancelled retry, search toggles, job error"))
+  ptm_QUALITY_DONE(("QUALITY_DONE: Tests green for new behaviors"))
+  ptm_RELEASED(("RELEASED: Consistency fixes accepted and documented"))
+  ptm_P0_HTML_DONE -->|"ARCHIVE_DEPENDENCY: Do not archive parents with live dependents#59; claim/orphan archived / done"| ptm_P0_ARCHIVE_DONE
+  ptm_P0_HOUSEKEEP_DONE -->|"CLASSIFY_TS_SEGMENT: Align .ts/.m4s segment rejection scraper ↔ extension / done"| ptm_P1_CORE_DONE
+  ptm_P0_HOUSEKEEP_DONE -->|"CLI_RETRY_RUNTIME: CLI queue retry/reindex ensure runtime like API / done"| ptm_P1_CORE_DONE
+  ptm_QUALITY_DONE -->|"DOCS_ENV_README: README env catalog + reindex path note + multi-worker wording / done"| ptm_RELEASED
+  ptm_P0_ARCHIVE_DONE -->|"HOUSEKEEP_RETRY_SEMANTICS: Housekeep grants one extra attempt, not full attempts reset / done"| ptm_P0_HOUSEKEEP_DONE
+  ptm_NOW -->|"HTML_API_SURFACE: API enqueue: HTML/unknown routes to candidates semantics / done"| ptm_P0_HTML_DONE
+  ptm_NOW -->|"HTML_WEB_EXT: Web Get + extension: page URLs use scrape/detect not blind enqueue / done"| ptm_P0_HTML_DONE
+  ptm_NOW -->|"HTML_WORKER_NONINTERACTIVE: Worker HTML path never prompts#59; non-TTY safe / done"| ptm_P0_HTML_DONE
+  ptm_P1_WEB_DONE -->|"TESTS_CONSISTENCY: Tests: HTML non-interactive, archive deps, housekeep attempt, ts reject / done"| ptm_QUALITY_DONE
+  ptm_P1_CORE_DONE -->|"WEB_ENQUEUE_OPTS: Web force / no_index + skip known unless force / done"| ptm_P1_WEB_DONE
+  ptm_P1_CORE_DONE -->|"WEB_QUEUE_SEARCH: Web queue error/cancelled retry#59; search modality/by_scene / done"| ptm_P1_WEB_DONE
+  classDef pt_milestone_planned fill:#ffffff,stroke:#566573,stroke-width:1px;
+  classDef pt_milestone_reached fill:#d5f5e3,stroke:#1e8449,stroke-width:2px;
+  class ptm_NOW,ptm_P0_ARCHIVE_DONE,ptm_P0_HOUSEKEEP_DONE,ptm_P0_HTML_DONE,ptm_P1_CORE_DONE,ptm_P1_WEB_DONE,ptm_QUALITY_DONE,ptm_RELEASED pt_milestone_reached;
+  linkStyle 0 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 1 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 2 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 3 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 4 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 5 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 6 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 7 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 8 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 9 stroke:#95a5a6,stroke-width:2px;
+  linkStyle 10 stroke:#95a5a6,stroke-width:2px;
+  %% perttool:projection-end

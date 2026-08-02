@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -741,6 +743,24 @@ class DownloadService:
                     )
                 ]
         else:
+            # Daemon / non-TTY workers must never block on console.input
+            interactive = sys.stdin.isatty() and not os.environ.get(
+                "VDL_NONINTERACTIVE", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if not interactive:
+                console.print(
+                    "[dim]非対話モード: 候補一覧のみ（投入は CLI --enqueue -y "
+                    "または /api/candidates → batch）[/dim]"
+                )
+                return [
+                    ActionResult(
+                        status="listed",
+                        message=(
+                            f"{len(rows)} candidates from {page_url} "
+                            "(non-interactive; not enqueued)"
+                        ),
+                    )
+                ]
             chosen_idx = self._prompt_selection(len(rows), new_indices)
             if chosen_idx is None:
                 return [ActionResult(status="listed", message="キャンセル")]

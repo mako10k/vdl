@@ -666,28 +666,70 @@ class JobQueue:
             if job.status == "failed" and auto_retry:
                 retryable = is_retryable_error(job.error, kind=job.kind)
                 cool = age >= max(0.0, retry_after_minutes)
-                before_archive = age < max(0.0, archive_after_minutes)
-                # either cool-down window, or last chance right at archive age
+                # last chance right at archive age if not yet housekeep-retried
                 last_chance = age >= max(0.0, archive_after_minutes) and hk == 0
-                if retryable and hk == 0 and (cool or last_chance):
-                    # mark housekeep_retried then re-queue
+                # Single extra attempt only: do not reset full attempt budget
+                under_cap = int(job.attempts or 0) < max_att + 1
+                if retryable and hk == 0 and under_cap and (cool or last_chance):
                     with self._conn() as conn:
                         conn.execute(
-                            "UPDATE jobs SET housekeep_retried = 1 WHERE id = ?",
-                            (job.id,),
+                            """
+                            UPDATE jobs SET
+                                status = 'pending',
+                                housekeep_retried = 1,
+                                error = ?,
+                                result_json = NULL,
+                                started_at = NULL,
+                                finished_at = NULL,
+                                progress_msg = ?,
+                                eta_sec = NULL,
+                                updated_at = ?
+                            WHERE id = ? AND status = 'failed'
+                            """,
+                            (
+                                job.error,
+                                f"housekeep retry (attempts={job.attempts}/{max_att})",
+                                _utc_now(),
+                                job.id,
+                            ),
                         )
-                    self.retry(job.id)
+                        # reopen cancelled direct chain once (same as manual retry)
+                        conn.execute(
+                            """
+                            UPDATE jobs SET
+                                status = 'pending',
+                                attempts = 0,
+                                error = NULL,
+                                finished_at = NULL,
+                                started_at = NULL,
+                                progress_msg = 'retry (housekeep chain)',
+                                updated_at = ?
+                            WHERE depends_on_job_id = ?
+                              AND status = 'cancelled'
+                            """,
+                            (_utc_now(), job.id),
+                        )
                     stats["retried"] += 1
                     stats["retry_ids"].append(job.id)
                     continue
 
             if age >= max(0.0, archive_after_minutes):
-                # Don't archive if we just requeued
                 if job.status == "failed" and auto_retry and hk == 0 and is_retryable_error(
                     job.error, kind=job.kind
                 ):
                     continue
+                # Never archive a parent while dependents are still live
                 with self._conn() as conn:
+                    live = conn.execute(
+                        """
+                        SELECT COUNT(*) AS n FROM jobs
+                        WHERE depends_on_job_id = ?
+                          AND status IN ('pending', 'running')
+                        """,
+                        (job.id,),
+                    ).fetchone()["n"]
+                    if live:
+                        continue
                     cur = conn.execute(
                         """
                         UPDATE jobs SET
@@ -804,7 +846,17 @@ class JobQueue:
                 FROM jobs j
                 JOIN jobs d ON d.id = j.depends_on_job_id
                 WHERE j.status = 'pending'
-                  AND d.status IN ('failed', 'cancelled')
+                  AND (
+                    d.status IN ('failed', 'cancelled')
+                    OR (
+                      d.status = 'archived'
+                      AND (
+                        d.error IS NOT NULL
+                        OR COALESCE(d.progress_msg, '') LIKE '%failed%'
+                        OR COALESCE(d.progress_msg, '') LIKE '%cancel%'
+                      )
+                    )
+                  )
                 """
             ).fetchall()
             for row in rows:
@@ -854,38 +906,43 @@ class JobQueue:
                 (JobKind.DAEMON_RELOAD.value,),
             ).fetchone()
 
+            # Parent satisfied if done, or archived after successful completion
+            # (archived after fail is handled by orphan cancel, not claim).
+            dep_ok = """
+                        j.depends_on_job_id IS NULL
+                        OR EXISTS (
+                          SELECT 1 FROM jobs d
+                          WHERE d.id = j.depends_on_job_id
+                            AND (
+                              d.status = 'done'
+                              OR (
+                                d.status = 'archived'
+                                AND d.error IS NULL
+                                AND COALESCE(d.progress_pct, 0) >= 100
+                              )
+                            )
+                        )
+            """
             if gate is not None:
                 if gate["status"] == "running":
                     # Reload already in progress — do not claim anything else.
                     return None
                 # Only claim the reload gate (must be runnable).
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT j.* FROM jobs j
                     WHERE j.id = ?
                       AND j.status = 'pending'
-                      AND (
-                        j.depends_on_job_id IS NULL
-                        OR EXISTS (
-                          SELECT 1 FROM jobs d
-                          WHERE d.id = j.depends_on_job_id AND d.status = 'done'
-                        )
-                      )
+                      AND ({dep_ok})
                     """,
                     (gate["id"],),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT j.* FROM jobs j
                     WHERE j.status = 'pending'
-                      AND (
-                        j.depends_on_job_id IS NULL
-                        OR EXISTS (
-                          SELECT 1 FROM jobs d
-                          WHERE d.id = j.depends_on_job_id AND d.status = 'done'
-                        )
-                      )
+                      AND ({dep_ok})
                     ORDER BY j.priority DESC, j.id ASC
                     LIMIT 1
                     """

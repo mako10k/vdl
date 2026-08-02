@@ -163,16 +163,30 @@ export const api = {
     req<{ jobs: Record<string, number> }>(`/api/registry/${id}/reindex`, {
       method: 'POST',
     }),
-  searchText: (query: string, limit = 8) =>
+  searchText: (query: string, limit = 8, by_scene = false) =>
     req<{ hits: SearchHit[] }>('/api/search/text', {
       method: 'POST',
-      body: JSON.stringify({ query, limit }),
+      body: JSON.stringify({ query, limit, by_scene }),
     }),
-  searchSimilar: (download_id: number, modality: 'clip' | 'text' = 'clip', limit = 8) =>
+  searchSimilar: (
+    download_id: number,
+    modality: 'clip' | 'text' = 'clip',
+    limit = 8,
+    by_scene = false,
+    scene_index?: number | null,
+  ) =>
     req<{ hits: SearchHit[] }>('/api/search/similar', {
       method: 'POST',
-      body: JSON.stringify({ download_id, modality, limit }),
+      body: JSON.stringify({
+        download_id,
+        modality,
+        limit,
+        by_scene,
+        scene_index: scene_index ?? null,
+      }),
     }),
+  housekeep: () =>
+    req<Record<string, unknown>>('/api/queue/housekeep', { method: 'POST' }),
   retry: (id: number) =>
     req<Job>(`/api/queue/${id}/retry`, { method: 'POST' }),
   cancel: (id: number) =>

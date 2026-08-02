@@ -116,6 +116,9 @@ export VDL_LIST_CANCELLED_MINUTES=10
 # アーカイブ前にリトライ可能な失敗を自動リトライ（クールダウン分）
 export VDL_JOB_HOUSEKEEP_RETRY_AFTER_MIN=5
 export VDL_JOB_HOUSEKEEP_AUTO_RETRY=1
+# 一覧の done 保持分・表示件数
+export VDL_LIST_DONE_MINUTES=10
+export VDL_LIST_LIMIT=30
 
 # 自動起動したくないとき
 vdl get URL --no-daemon
@@ -133,7 +136,7 @@ vdl daemon run --workers 3 --idle 60
 | `vdl get URL --sync` | 同期 DL（デバッグ用） |
 | `vdl get URL --no-index` | 索引チェーンを載せない |
 | `vdl queue list/show/cancel/retry` | キュー操作 |
-| `vdl queue reindex <download_id>` | scene→clip→embed 再投入 |
+| `vdl queue reindex <download_id>` | scene→clip→embed 再投入（API は `POST /api/registry/{id}/reindex`） |
 | `vdl watch` | キュー進捗のライブ表示 |
 | `vdl supervisor start/stop/status/run` | **スーパーバイザ**（ワーカー監視・再起動） |
 | `vdl daemon start/stop/status/run` | ワーカー（**最大3並列**） |
@@ -186,7 +189,7 @@ export VDL_SCENE_THRESHOLD=0.3
 ## 非目標（MVP）
 
 - DRM / DASH 完全対応
-- マルチワーカー並列デーモン
+- 複数ホストにまたがる分散ワーカー（単一プロセス内の `VDL_DAEMON_WORKERS` 並列は対応）
 - CLIP によるテキスト→画像クロスモーダル検索（text 検索が主）
 
 ## 開発
