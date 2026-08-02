@@ -450,10 +450,39 @@ def queue_show(ctx: click.Context, job_id: int) -> None:
     console.print(f"depends:  {job.depends_on_job_id}")
     console.print(f"started:  {job.started_at or '-'}")
     console.print(f"updated:  {job.updated_at}")
+    # Surface artifacts / failures clearly
+    res = job.result or {}
+    paths = res.get("paths") or []
+    if not paths:
+        for r in res.get("results") or []:
+            if r.get("path"):
+                paths.append(r["path"])
+            elif isinstance(r.get("message"), str) and r["message"].startswith("/"):
+                paths.append(r["message"])
+    if paths:
+        console.print("[green]artifact:[/green]")
+        for p in paths:
+            console.print(f"  {p}")
+    if job.download_id:
+        reg = Registry(config.db_path)
+        rec = reg.get(job.download_id)
+        if rec:
+            console.print(
+                f"registry: id={rec.id} status={rec.status} "
+                f"size={rec.file_size or '-'} path={rec.file_path or '-'}"
+            )
+            if rec.error:
+                console.print(f"[red]  reg error: {rec.error}[/red]")
+    if res.get("failed"):
+        console.print("[yellow]partial failures:[/yellow]")
+        for f in res["failed"]:
+            console.print(f"  {f}")
     console.print(f"payload:  {job.payload}")
     console.print(f"result:   {job.result}")
     if job.error:
         console.print(f"[red]error:    {job.error}[/red]")
+    if job.status == "failed":
+        console.print("[dim]retry: vdl queue retry " + str(job.id) + "[/dim]")
 
 
 @queue_group.command("cancel")

@@ -185,9 +185,18 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
         )
 
     downloaded_ids: list[int] = []
+    artifact_paths: list[str] = []
     for r in results:
         if r.record_id and r.status in ("downloaded", "skipped"):
             downloaded_ids.append(r.record_id)
+            if r.path:
+                artifact_paths.append(str(r.path))
+            elif r.message and r.message.startswith("/"):
+                artifact_paths.append(r.message)
+
+    # Link job → primary registry record for easy lookup
+    if downloaded_ids:
+        queue.set_download_id(job.id, downloaded_ids[0])
 
     if not p.get("no_index"):
         reg = Registry(config.db_path)
@@ -196,7 +205,23 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
             if rec and rec.status == "completed" and rec.file_path:
                 enqueue_index_chain(queue, did)
 
-    _progress(queue, job, pct=100.0, message="done")
+    failed = [r for r in results if r.status == "failed"]
+    # No successful artifact → treat as job failure (visible in queue / retry)
+    if not downloaded_ids:
+        msgs = "; ".join(r.message for r in failed) if failed else "no media downloaded"
+        _progress(queue, job, pct=100.0, message=f"failed: {msgs[:80]}")
+        raise RuntimeError(msgs)
+
+    _progress(
+        queue,
+        job,
+        pct=100.0,
+        message=(
+            f"ok → {artifact_paths[0]}"
+            if artifact_paths
+            else f"ok download_id={downloaded_ids[0]}"
+        ),
+    )
     return {
         "results": [
             {
@@ -208,6 +233,8 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
             for r in results
         ],
         "download_ids": downloaded_ids,
+        "paths": artifact_paths,
+        "failed": [{"message": r.message, "record_id": r.record_id} for r in failed],
     }
 
 

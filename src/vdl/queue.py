@@ -498,6 +498,18 @@ class JobQueue:
             assert claimed is not None
             return self._row(claimed)
 
+    def set_download_id(self, job_id: int, download_id: int) -> None:
+        """Link a job to a registry downloads.id (for download/index jobs)."""
+        now = _utc_now()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET download_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (download_id, now, job_id),
+            )
+
     def update_progress(
         self,
         job_id: int,
