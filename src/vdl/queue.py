@@ -27,6 +27,81 @@ class JobStatus(str, Enum):
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    ARCHIVED = "archived"
+
+
+# Errors that usually succeed on another attempt
+_RETRYABLE_HINTS = (
+    "timeout",
+    "timed out",
+    "temporarily",
+    "connection",
+    "reset by peer",
+    "broken pipe",
+    "frame extract failed",
+    "ffmpeg",
+    "httpx",
+    "http error",
+    "status 5",
+    "503",
+    "502",
+    "504",
+    "429",
+    "unavailable",
+    "try again",
+    "econnreset",
+    "network",
+    "ssl",
+    "read error",
+    "write error",
+    "errno",
+)
+_NON_RETRYABLE_HINTS = (
+    "unsupported",
+    "mvp",
+    "not a media",
+    "invalid url",
+    "404",
+    "403",
+    "401",
+    "permission denied",
+    "no such file",
+    "missing on disk",
+    "cancelled (upstream",
+    "upstream job",
+)
+
+
+def is_retryable_error(error: str | None, *, kind: str | None = None) -> bool:
+    """Heuristic: whether a failed job is worth another try."""
+    if not error:
+        return True  # unknown — allow one housekeep retry
+    low = error.lower()
+    if any(h in low for h in _NON_RETRYABLE_HINTS):
+        return False
+    if any(h in low for h in _RETRYABLE_HINTS):
+        return True
+    # download / index stages: default optimistic for transient infra flakes
+    if kind in {
+        JobKind.DOWNLOAD.value,
+        JobKind.SCENE_DETECT.value,
+        JobKind.CLIP_OPTIMIZE.value,
+        JobKind.EMBED.value,
+    }:
+        return True
+    return False
+
+
+def _parse_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t
+    except Exception:
+        return None
 
 
 def _utc_now() -> str:
@@ -53,6 +128,8 @@ class Job:
     progress_current: Optional[int] = None
     progress_total: Optional[int] = None
     eta_sec: Optional[float] = None
+    # Number of finished attempts (failed runs). 0 = not yet failed.
+    attempts: int = 0
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -85,9 +162,14 @@ class Job:
             return "queued"
         if self.status == "cancelled":
             return "cancelled"
+        if self.status == "archived":
+            return "archived"
         if self.status == "failed":
             pct = self.progress_pct if self.progress_pct is not None else 0.0
-            return f"failed @{pct:.0f}%"
+            att = f" after {self.attempts} try" if self.attempts else ""
+            if self.attempts and self.attempts != 1:
+                att = f" after {self.attempts} tries"
+            return f"failed @{pct:.0f}%{att}"
         if self.status == "done":
             return "100% done"
 
@@ -97,6 +179,8 @@ class Job:
         filled = min(bar_width, max(0, filled))
         bar = "=" * filled + "-" * (bar_width - filled)
         parts = [f"[{bar}] {pct:5.1f}%"]
+        if self.attempts and self.status in ("pending", "running"):
+            parts.append(f"try {self.attempts + 1}")
         if self.progress_current is not None and self.progress_total:
             parts.append(f"{self.progress_current}/{self.progress_total}")
         if self.progress_msg:
@@ -255,6 +339,8 @@ class JobQueue:
             ("progress_current", "INTEGER"),
             ("progress_total", "INTEGER"),
             ("eta_sec", "REAL"),
+            ("attempts", "INTEGER DEFAULT 0"),
+            ("housekeep_retried", "INTEGER DEFAULT 0"),
         ]
         for name, decl in migrations:
             if name not in cols:
@@ -281,7 +367,15 @@ class JobQueue:
             progress_current=row["progress_current"] if "progress_current" in keys else None,
             progress_total=row["progress_total"] if "progress_total" in keys else None,
             eta_sec=row["eta_sec"] if "eta_sec" in keys else None,
+            attempts=int(row["attempts"] or 0) if "attempts" in keys else 0,
         )
+
+    def _job_age_minutes(self, job: Job, *, now: datetime | None = None) -> float | None:
+        now = now or datetime.now(timezone.utc)
+        ts = _parse_ts(job.finished_at or job.updated_at)
+        if not ts:
+            return None
+        return max(0.0, (now - ts).total_seconds() / 60.0)
 
     def enqueue(
         self,
@@ -349,6 +443,35 @@ class JobQueue:
             ).fetchall()
             return [self._row(r) for r in rows]
 
+    def active_download_urls(self) -> set[str]:
+        """Normalized URLs with pending/running download jobs (for candidate dedupe)."""
+        from vdl.util import normalize_url
+
+        out: set[str] = set()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM jobs
+                WHERE kind = 'download'
+                  AND status IN ('pending', 'running')
+                """
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            url = payload.get("url")
+            if isinstance(url, str) and url.strip():
+                out.add(normalize_url(url.strip()))
+            # batch HTML may store urls list
+            urls = payload.get("urls")
+            if isinstance(urls, list):
+                for u in urls:
+                    if isinstance(u, str) and u.strip():
+                        out.add(normalize_url(u.strip()))
+        return out
+
     def list_jobs_display(
         self,
         *,
@@ -356,79 +479,230 @@ class JobQueue:
         kind: str | None = None,
         limit: int = 30,
         done_within_minutes: float = 10.0,
+        failed_within_minutes: float | None = None,
+        cancelled_within_minutes: float | None = None,
         include_all_done: bool = False,
+        include_archived: bool = False,
         major_kinds: tuple[str, ...] | None = None,
     ) -> tuple[list[Job], dict[str, Any]]:
         """
-        List jobs for CLI/watch with done-history collapsed.
+        List jobs for CLI/watch — only “effective” rows by default.
 
         Default keeps:
-        - all non-done (pending/running/failed/cancelled)
-        - done jobs finished within done_within_minutes
-        - the latest done job per major kind (download / index stages / reload)
+        - all pending / running
+        - done finished within done_within_minutes
+        - failed finished within failed_within_minutes (default 30)
+        - cancelled finished within cancelled_within_minutes (default 10)
+          (upstream-cascade cancels hide sooner: half window)
+        - never archived (unless status=archived or include_archived)
 
-        Returns (jobs, meta) where meta explains filtering for the UI.
+        include_all_done / status filters bypass time windows for that status.
         """
-        kinds = major_kinds or (
-            JobKind.DOWNLOAD.value,
-            JobKind.SCENE_DETECT.value,
-            JobKind.CLIP_OPTIMIZE.value,
-            JobKind.EMBED.value,
-            JobKind.DAEMON_RELOAD.value,
-        )
-        # Fetch a wider window then filter (simple, portable).
-        fetch_n = max(limit * 8, 80)
-        raw = self.list_jobs(status=status, kind=kind, limit=fetch_n)
+        from vdl.config import LIST_CANCELLED_MINUTES, LIST_FAILED_MINUTES
 
-        if include_all_done or status == "done":
+        fail_mins = (
+            LIST_FAILED_MINUTES
+            if failed_within_minutes is None
+            else float(failed_within_minutes)
+        )
+        canc_mins = (
+            LIST_CANCELLED_MINUTES
+            if cancelled_within_minutes is None
+            else float(cancelled_within_minutes)
+        )
+
+        # Fetch a wider window then filter (simple, portable).
+        fetch_n = max(limit * 20, 200)
+        if status == "archived" or include_archived:
+            raw = self.list_jobs(status=status, kind=kind, limit=fetch_n)
+        elif status:
+            raw = self.list_jobs(status=status, kind=kind, limit=fetch_n)
+        else:
+            # exclude archived from default pull
+            with self._conn() as conn:
+                clauses = ["status != 'archived'"]
+                args: list[Any] = []
+                if kind:
+                    clauses.append("kind = ?")
+                    args.append(kind)
+                args.append(fetch_n)
+                rows_db = conn.execute(
+                    f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} "
+                    f"ORDER BY id DESC LIMIT ?",
+                    args,
+                ).fetchall()
+                raw = [self._row(r) for r in rows_db]
+
+        if include_all_done or status in (
+            "done",
+            "failed",
+            "cancelled",
+            "archived",
+            "pending",
+            "running",
+        ):
             rows = raw[:limit]
             return rows, {
                 "filtered": False,
-                "hidden_done": 0,
+                "hidden": 0,
                 "done_within_minutes": done_within_minutes,
+                "failed_within_minutes": fail_mins,
+                "cancelled_within_minutes": canc_mins,
                 "limit": limit,
             }
 
         now = datetime.now(timezone.utc)
-        cutoff = now.timestamp() - max(0.0, done_within_minutes) * 60.0
-        latest_done_by_kind: dict[str, int] = {}
-        for j in raw:
-            if j.status != "done":
-                continue
-            if j.kind not in latest_done_by_kind:
-                latest_done_by_kind[j.kind] = j.id
+        hidden = {"done": 0, "failed": 0, "cancelled": 0, "archived": 0}
+
+        def _age_ok(j: Job, minutes: float) -> bool:
+            age = self._job_age_minutes(j, now=now)
+            if age is None:
+                return True
+            return age <= max(0.0, minutes)
 
         def _keep(j: Job) -> bool:
-            if j.status != "done":
+            if j.status == "archived":
+                hidden["archived"] += 1
+                return False
+            if j.status in ("pending", "running"):
                 return True
-            # recent done
-            ts_src = j.finished_at or j.updated_at
-            try:
-                ts = datetime.fromisoformat(ts_src.replace("Z", "+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if ts.timestamp() >= cutoff:
+            if j.status == "done":
+                if _age_ok(j, done_within_minutes):
                     return True
-            except Exception:
-                pass
-            # latest of major kind
-            if j.kind in kinds and latest_done_by_kind.get(j.kind) == j.id:
-                return True
-            return False
+                hidden["done"] += 1
+                return False
+            if j.status == "failed":
+                if _age_ok(j, fail_mins):
+                    return True
+                hidden["failed"] += 1
+                return False
+            if j.status == "cancelled":
+                # cascade noise: shorter window
+                err = (j.error or "") + " " + (j.progress_msg or "")
+                window = canc_mins
+                if "upstream" in err.lower():
+                    window = min(window, max(2.0, canc_mins * 0.5))
+                if _age_ok(j, window):
+                    return True
+                hidden["cancelled"] += 1
+                return False
+            return True
 
         kept = [j for j in raw if _keep(j)]
-        hidden = sum(1 for j in raw if j.status == "done" and not _keep(j))
-        # Prefer active jobs first, then by id desc (already desc)
-        active_order = {"running": 0, "pending": 1, "failed": 2, "cancelled": 3, "done": 4}
+        active_order = {
+            "running": 0,
+            "pending": 1,
+            "failed": 2,
+            "cancelled": 3,
+            "done": 4,
+            "archived": 5,
+        }
         kept.sort(key=lambda j: (active_order.get(j.status, 9), -j.id))
         rows = kept[:limit]
         return rows, {
             "filtered": True,
-            "hidden_done": hidden,
+            "hidden": sum(hidden.values()),
+            "hidden_detail": hidden,
+            "hidden_done": hidden["done"],  # backward compat
             "done_within_minutes": done_within_minutes,
+            "failed_within_minutes": fail_mins,
+            "cancelled_within_minutes": canc_mins,
             "limit": limit,
-            "latest_done_kinds": latest_done_by_kind,
         }
+
+    def housekeep(
+        self,
+        *,
+        archive_after_minutes: float = 60.0,
+        retry_after_minutes: float = 5.0,
+        auto_retry: bool = True,
+        max_attempts: int | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """
+        Maintenance pass:
+        1) cancel orphans stuck on failed parents
+        2) auto-retry failed jobs that look recoverable (once via housekeep_retried)
+        3) archive done/failed/cancelled older than archive_after_minutes
+           (retryable failures get one last retry before archive if not yet retried)
+        """
+        from vdl.config import JOB_MAX_ATTEMPTS
+
+        max_att = max(1, int(max_attempts if max_attempts is not None else JOB_MAX_ATTEMPTS))
+        now = datetime.now(timezone.utc)
+        stats: dict[str, Any] = {
+            "orphans_cancelled": 0,
+            "retried": 0,
+            "archived": 0,
+            "retry_ids": [],
+            "archived_ids": [],
+            "max_attempts": max_att,
+        }
+
+        orphans = self.cancel_orphaned_dependents()
+        stats["orphans_cancelled"] = len(orphans)
+
+        # Load terminal-ish jobs
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('failed', 'done', 'cancelled')
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        for row in rows:
+            job = self._row(row)
+            age = self._job_age_minutes(job, now=now)
+            if age is None:
+                continue
+            hk = 0
+            if "housekeep_retried" in row.keys():
+                hk = int(row["housekeep_retried"] or 0)
+
+            if job.status == "failed" and auto_retry:
+                retryable = is_retryable_error(job.error, kind=job.kind)
+                cool = age >= max(0.0, retry_after_minutes)
+                before_archive = age < max(0.0, archive_after_minutes)
+                # either cool-down window, or last chance right at archive age
+                last_chance = age >= max(0.0, archive_after_minutes) and hk == 0
+                if retryable and hk == 0 and (cool or last_chance):
+                    # mark housekeep_retried then re-queue
+                    with self._conn() as conn:
+                        conn.execute(
+                            "UPDATE jobs SET housekeep_retried = 1 WHERE id = ?",
+                            (job.id,),
+                        )
+                    self.retry(job.id)
+                    stats["retried"] += 1
+                    stats["retry_ids"].append(job.id)
+                    continue
+
+            if age >= max(0.0, archive_after_minutes):
+                # Don't archive if we just requeued
+                if job.status == "failed" and auto_retry and hk == 0 and is_retryable_error(
+                    job.error, kind=job.kind
+                ):
+                    continue
+                with self._conn() as conn:
+                    cur = conn.execute(
+                        """
+                        UPDATE jobs SET
+                            status = 'archived',
+                            updated_at = ?,
+                            progress_msg = COALESCE(progress_msg, 'archived')
+                        WHERE id = ? AND status IN ('done', 'failed', 'cancelled')
+                        """,
+                        (_utc_now(), job.id),
+                    )
+                    if cur.rowcount:
+                        stats["archived"] += 1
+                        stats["archived_ids"].append(job.id)
+
+        return stats
 
     def find_active_reload(self) -> Optional[Job]:
         """Pending or running daemon_reload job (newest)."""
@@ -515,6 +789,47 @@ class JobQueue:
                 (job.id, now, job.id, JobKind.DAEMON_RELOAD.value),
             )
         return self.get(job.id) or job
+
+    def cancel_orphaned_dependents(self) -> list[int]:
+        """
+        Cancel pending jobs whose dependency is already failed/cancelled
+        (safety net for rows created before cascade-on-fail).
+        """
+        now = _utc_now()
+        cancelled: list[int] = []
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT j.id, j.depends_on_job_id, d.status AS dep_status
+                FROM jobs j
+                JOIN jobs d ON d.id = j.depends_on_job_id
+                WHERE j.status = 'pending'
+                  AND d.status IN ('failed', 'cancelled')
+                """
+            ).fetchall()
+            for row in rows:
+                reason = (
+                    f"upstream job #{row['depends_on_job_id']} is {row['dep_status']}"
+                )
+                cur = conn.execute(
+                    """
+                    UPDATE jobs SET
+                        status = 'cancelled',
+                        error = ?,
+                        finished_at = ?,
+                        updated_at = ?,
+                        progress_msg = 'cancelled (upstream failed)'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (reason, now, now, row["id"]),
+                )
+                if cur.rowcount:
+                    cancelled.append(int(row["id"]))
+        # one more pass for multi-level chains
+        if cancelled:
+            more = self.cancel_orphaned_dependents()
+            cancelled.extend(more)
+        return cancelled
 
     def claim_next(self) -> Optional[Job]:
         """
@@ -801,27 +1116,138 @@ class JobQueue:
             ),
         }
 
-    def mark_failed(self, job_id: int, error: str) -> Job:
+    def mark_failed(
+        self,
+        job_id: int,
+        error: str,
+        *,
+        max_attempts: int | None = None,
+        cancel_dependents: bool = True,
+    ) -> Job:
+        """
+        Record a failed attempt.
+
+        If attempts < max_attempts, re-queue as pending (auto-retry).
+        Otherwise mark failed permanently and cancel pending dependents.
+        """
+        from vdl.config import JOB_MAX_ATTEMPTS
+
+        max_att = max(1, int(max_attempts if max_attempts is not None else JOB_MAX_ATTEMPTS))
         now = _utc_now()
         with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"job {job_id} not found")
+            prev_attempts = int(row["attempts"] or 0) if "attempts" in row.keys() else 0
+            attempts = prev_attempts + 1
+            err_text = (error or "unknown error")[:2000]
+
+            if attempts < max_att:
+                # Auto-retry: back to pending for another claim
+                msg = f"retry {attempts}/{max_att - 1}: {err_text[:120]}"
+                conn.execute(
+                    """
+                    UPDATE jobs SET
+                        status = 'pending',
+                        attempts = ?,
+                        error = ?,
+                        result_json = NULL,
+                        started_at = NULL,
+                        finished_at = NULL,
+                        progress_msg = ?,
+                        progress_pct = COALESCE(progress_pct, 0),
+                        eta_sec = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (attempts, err_text, msg, now, job_id),
+                )
+                out = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                assert out is not None
+                return self._row(out)
+
+            # Permanent failure
             conn.execute(
                 """
                 UPDATE jobs SET
                     status = 'failed',
+                    attempts = ?,
                     error = ?,
                     finished_at = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    progress_msg = COALESCE(progress_msg, 'failed')
                 WHERE id = ?
                 """,
-                (error, now, now, job_id),
+                (attempts, err_text, now, now, job_id),
             )
-            row = conn.execute(
+            out = conn.execute(
                 "SELECT * FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
-            assert row is not None
-            return self._row(row)
+            assert out is not None
+            job = self._row(out)
 
-    def cancel(self, job_id: int) -> Optional[Job]:
+        if cancel_dependents:
+            self.cancel_dependents(
+                job_id,
+                reason=f"upstream job #{job_id} failed: {err_text[:200]}",
+            )
+        return job
+
+    def cancel_dependents(
+        self,
+        job_id: int,
+        *,
+        reason: str = "upstream cancelled",
+    ) -> list[int]:
+        """
+        Cancel all pending (and recursively dependent) jobs that depend on job_id.
+        Does not cancel already running jobs (would need cooperative cancel).
+        Returns cancelled job ids.
+        """
+        cancelled: list[int] = []
+        queue_ids = [job_id]
+        seen: set[int] = {job_id}
+        now = _utc_now()
+        with self._conn() as conn:
+            while queue_ids:
+                parent = queue_ids.pop(0)
+                rows = conn.execute(
+                    """
+                    SELECT id, status FROM jobs
+                    WHERE depends_on_job_id = ?
+                    """,
+                    (parent,),
+                ).fetchall()
+                for row in rows:
+                    cid = int(row["id"])
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    st = row["status"]
+                    if st == "pending":
+                        cur = conn.execute(
+                            """
+                            UPDATE jobs SET
+                                status = 'cancelled',
+                                error = ?,
+                                finished_at = ?,
+                                updated_at = ?,
+                                progress_msg = 'cancelled (upstream failed)'
+                            WHERE id = ? AND status = 'pending'
+                            """,
+                            (reason[:2000], now, now, cid),
+                        )
+                        if cur.rowcount:
+                            cancelled.append(cid)
+                    # Always walk dependents (scene→clip→embed chain)
+                    queue_ids.append(cid)
+        return cancelled
+
+    def cancel(self, job_id: int, *, cascade: bool = True) -> Optional[Job]:
         now = _utc_now()
         with self._conn() as conn:
             row = conn.execute(
@@ -830,21 +1256,29 @@ class JobQueue:
             if not row:
                 return None
             if row["status"] not in ("pending", "running"):
-                return self._row(row)
-            conn.execute(
-                """
-                UPDATE jobs SET status = 'cancelled', finished_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, now, job_id),
+                job = self._row(row)
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                        progress_msg = 'cancelled'
+                    WHERE id = ?
+                    """,
+                    (now, now, job_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                assert row is not None
+                job = self._row(row)
+        if cascade:
+            self.cancel_dependents(
+                job_id, reason=f"upstream job #{job_id} cancelled"
             )
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
-            assert row is not None
-            return self._row(row)
+        return job
 
     def retry(self, job_id: int) -> Optional[Job]:
+        """Manual / housekeep retry: reset attempts and re-queue failed/cancelled/archived."""
         now = _utc_now()
         with self._conn() as conn:
             row = conn.execute(
@@ -852,32 +1286,77 @@ class JobQueue:
             ).fetchone()
             if not row:
                 return None
-            if row["status"] not in ("failed", "cancelled"):
+            if row["status"] not in ("failed", "cancelled", "archived"):
                 return self._row(row)
             conn.execute(
                 """
                 UPDATE jobs SET
                     status = 'pending',
+                    attempts = 0,
                     error = NULL,
                     result_json = NULL,
                     started_at = NULL,
                     finished_at = NULL,
+                    progress_msg = 'retry (manual)',
+                    progress_pct = 0,
+                    eta_sec = NULL,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (now, job_id),
             )
+            # Re-open cancelled descendants so index chains can run again
+            walk = [job_id]
+            seen: set[int] = {job_id}
+            while walk:
+                parent = walk.pop(0)
+                kids = conn.execute(
+                    "SELECT id, status FROM jobs WHERE depends_on_job_id = ?",
+                    (parent,),
+                ).fetchall()
+                for kid in kids:
+                    kid_id = int(kid["id"])
+                    if kid_id in seen:
+                        continue
+                    seen.add(kid_id)
+                    walk.append(kid_id)
+                    if kid["status"] == "cancelled":
+                        conn.execute(
+                            """
+                            UPDATE jobs SET
+                                status = 'pending',
+                                attempts = 0,
+                                error = NULL,
+                                finished_at = NULL,
+                                started_at = NULL,
+                                progress_msg = 'retry (manual chain)',
+                                progress_pct = 0,
+                                eta_sec = NULL,
+                                updated_at = ?
+                            WHERE id = ? AND status = 'cancelled'
+                            """,
+                            (now, kid_id),
+                        )
             row = conn.execute(
                 "SELECT * FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             assert row is not None
             return self._row(row)
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, *, include_archived: bool = True) -> dict[str, int]:
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
-            ).fetchall()
+            if include_archived:
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS n FROM jobs
+                    WHERE status != 'archived'
+                    GROUP BY status
+                    """
+                ).fetchall()
             return {r["status"]: r["n"] for r in rows}
 
     # --- scenes / embeddings meta ---

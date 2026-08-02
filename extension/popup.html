@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vdl</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1><span>vdl</span></h1>
+      <div id="conn" class="badge off">API …</div>
+    </header>
+
+    <section class="status-row" id="statusRow">
+      <span class="badge" id="supBadge">sup · —</span>
+      <span class="badge" id="workerBadge">worker · —</span>
+      <span class="badge muted" id="countsBadge">queue · —</span>
+    </section>
+
+    <section>
+      <div class="toolbar">
+        <label class="lbl">ページ内検出 <span id="detectMeta" class="muted"></span></label>
+        <div class="row tight">
+          <button id="btnDetect" class="btn tiny" type="button">再検出</button>
+          <button id="btnClearDetect" class="btn tiny" type="button">クリア</button>
+          <button id="btnOpenConsole" class="btn tiny primary" type="button">
+            Console で開く
+          </button>
+        </div>
+      </div>
+      <div id="detectList" class="cand-list"></div>
+      <div class="row" style="margin-top: 6px">
+        <button id="btnEnqueueDetected" class="btn primary" type="button" disabled>
+          選択を DL 投入
+        </button>
+        <button id="btnSelectDetectAll" class="btn tiny" type="button">全選択</button>
+      </div>
+    </section>
+
+    <section>
+      <label class="lbl">URL 直接投入 / サーバー候補</label>
+      <input id="url" type="text" spellcheck="false" placeholder="https://…" />
+      <div class="row">
+        <select id="quality" title="quality">
+          <option value="best">best</option>
+          <option value="worst">worst</option>
+          <option value="720">720</option>
+          <option value="1080">1080</option>
+        </select>
+        <button id="btnEnqueue" class="btn" type="button">Enqueue</button>
+        <button id="btnScrape" class="btn" type="button">サーバー抽出</button>
+      </div>
+    </section>
+
+    <section id="candSection" class="hidden">
+      <div class="toolbar">
+        <label class="lbl">サーバー候補 <span id="candMeta" class="muted"></span></label>
+        <div class="row tight">
+          <button id="btnSelectNew" class="btn tiny" type="button">新規のみ</button>
+          <button id="btnEnqueueSelected" class="btn tiny primary" type="button">
+            選択を投入
+          </button>
+        </div>
+      </div>
+      <div id="candList" class="cand-list"></div>
+    </section>
+
+    <section>
+      <div class="toolbar">
+        <label class="lbl">Queue</label>
+        <div class="row tight">
+          <button id="btnRefresh" class="btn tiny" type="button">更新</button>
+          <button id="btnOpenQueue" class="btn tiny" type="button">Console キュー</button>
+        </div>
+      </div>
+      <div id="jobs" class="jobs"></div>
+    </section>
+
+    <footer>
+      <a id="openUi" href="#" target="_blank" rel="noreferrer">Console UI</a>
+      <a id="openOpts" href="#">設定</a>
+    </footer>
+
+    <div id="msg" class="msg hidden"></div>
+    <div id="err" class="err hidden"></div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

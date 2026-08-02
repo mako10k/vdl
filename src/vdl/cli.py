@@ -105,7 +105,8 @@ def _watch_dashboard(
     """Build a refreshable dashboard for `vdl watch`."""
     q = JobQueue(config.db_path)
     st = daemon_status(config)
-    counts = q.counts()
+    counts = q.counts(include_archived=False)
+    n_arch = q.counts(include_archived=True).get("archived", 0)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     done_mins = (
         float(done_within_minutes)
@@ -157,6 +158,8 @@ def _watch_dashboard(
         n = counts.get(key, 0)
         if n:
             counts_parts.append(f"[{_status_style(key)}]{key}={n}[/{_status_style(key)}]")
+    if n_arch:
+        counts_parts.append(f"[dim]archived={n_arch}[/dim]")
     counts_line = "  ".join(counts_parts) if counts_parts else "[dim]queue empty[/dim]"
 
     header = Panel(
@@ -181,13 +184,13 @@ def _watch_dashboard(
         rows, filter_meta = q.list_jobs_display(
             limit=limit,
             done_within_minutes=done_mins,
+            failed_within_minutes=config.list_failed_minutes,
+            cancelled_within_minutes=config.list_cancelled_minutes,
             include_all_done=include_all_done,
         )
         title = f"jobs (≤{limit}"
         if filter_meta.get("filtered"):
-            title += f", done≤{done_mins:g}m + latest/kind"
-            if filter_meta.get("hidden_done"):
-                title += f", hidden_done={filter_meta['hidden_done']}"
+            title += f", active+recent; hidden={filter_meta.get('hidden', 0)}"
         title += ")"
 
     if rows:
@@ -464,10 +467,12 @@ def _run_html_get(
 
         if sync:
             for i in indices:
-                c, existing = rows[i]
-                if existing and not force:
+                row = rows[i]
+                c = row.candidate
+                if row.known and not force:
                     console.print(
-                        f"[yellow]#{i+1} スキップ[/yellow] 済 id={existing.id}"
+                        f"[yellow]#{i+1} スキップ[/yellow] "
+                        f"{row.state_label} id={row.download_id}"
                     )
                     continue
                 console.print(f"[bold]#{i+1} sync DL[/bold] {c.url}")
@@ -486,14 +491,28 @@ def _run_html_get(
             return
 
         q = JobQueue(config.db_path)
+        # within this batch + live queue: avoid simultaneous duplicates
+        seen_batch: set[str] = set()
         job_ids: list[int] = []
         for i in indices:
-            c, existing = rows[i]
-            if existing and not force:
+            row = rows[i]
+            c = row.candidate
+            nkey = normalize_url(c.url)
+            if nkey in seen_batch:
+                console.print(f"[yellow]#{i+1} スキップ[/yellow] 同一抽出内の重複")
+                continue
+            if row.known and not force:
                 console.print(
-                    f"[yellow]#{i+1} スキップ[/yellow] 済 id={existing.id} {c.url}"
+                    f"[yellow]#{i+1} スキップ[/yellow] "
+                    f"{row.state_label} id={row.download_id} {c.url}"
                 )
                 continue
+            # re-check active queue (another process may have enqueued)
+            active = q.active_download_urls()
+            if nkey in active and not force:
+                console.print(f"[yellow]#{i+1} スキップ[/yellow] 既にキュー中 {c.url}")
+                continue
+            seen_batch.add(nkey)
             job = enqueue_download(
                 q,
                 c.url,
@@ -633,7 +652,8 @@ def queue_group() -> None:
 @click.option(
     "--status",
     type=click.Choice(
-        ["pending", "running", "done", "failed", "cancelled"], case_sensitive=False
+        ["pending", "running", "done", "failed", "cancelled", "archived"],
+        case_sensitive=False,
     ),
     default=None,
 )
@@ -669,7 +689,7 @@ def queue_group() -> None:
     "--all-done",
     "include_all_done",
     is_flag=True,
-    help="古い done もすべて表示候補に含める（limit 内）",
+    help="時間フィルタを外し status 指定なしで広く表示（limit 内）",
 )
 @click.pass_context
 def queue_list(
@@ -691,20 +711,75 @@ def queue_list(
         kind=kind,
         limit=lim,
         done_within_minutes=mins,
-        include_all_done=include_all_done or (status == "done"),
+        failed_within_minutes=config.list_failed_minutes,
+        cancelled_within_minutes=config.list_cancelled_minutes,
+        include_all_done=include_all_done
+        or (status in ("done", "failed", "cancelled", "archived") if status else False),
     )
-    counts = q.counts()
-    console.print(f"[dim]counts={counts}[/dim]")
+    counts = q.counts(include_archived=True)
+    active = q.counts(include_archived=False)
+    console.print(f"[dim]active={active}  all={counts}[/dim]")
     if meta.get("filtered"):
+        hd = meta.get("hidden_detail") or {}
         console.print(
-            f"[dim]filter: done last {mins:g}m + latest/kind; "
-            f"hidden_done≈{meta.get('hidden_done', 0)}; limit={lim} "
-            f"(--all-done で履歴全表示)[/dim]"
+            f"[dim]filter: run/pending + done≤{mins:g}m "
+            f"failed≤{meta.get('failed_within_minutes', 30):g}m "
+            f"cancelled≤{meta.get('cancelled_within_minutes', 10):g}m; "
+            f"hidden≈{meta.get('hidden', 0)} {hd}; limit={lim} "
+            f"(--all-done / --status で履歴)[/dim]"
         )
     if not rows:
-        console.print("[dim]ジョブなし[/dim]")
+        console.print("[dim]有効なジョブなし（アーカイブ済みは --status archived）[/dim]")
         return
     console.print(_jobs_table(rows))
+
+
+@queue_group.command("housekeep")
+@click.option(
+    "--archive-after",
+    default=None,
+    type=float,
+    help="終了ジョブをアーカイブする分数 (default: VDL_JOB_ARCHIVE_MINUTES)",
+)
+@click.option(
+    "--retry-after",
+    default=None,
+    type=float,
+    help="失敗ジョブの自動リトライまでの待ち分数",
+)
+@click.option("--no-retry", is_flag=True, help="アーカイブ前の自動リトライをしない")
+@click.pass_context
+def queue_housekeep(
+    ctx: click.Context,
+    archive_after: Optional[float],
+    retry_after: Optional[float],
+    no_retry: bool,
+) -> None:
+    """失敗の自動リトライ（対象のみ）と、古い終了ジョブのアーカイブ。"""
+    config: Config = ctx.obj["config"]
+    q = JobQueue(config.db_path)
+    stats = q.housekeep(
+        archive_after_minutes=float(
+            archive_after
+            if archive_after is not None
+            else config.job_archive_minutes
+        ),
+        retry_after_minutes=float(
+            retry_after
+            if retry_after is not None
+            else config.job_housekeep_retry_after_min
+        ),
+        auto_retry=not no_retry and config.job_housekeep_auto_retry,
+        max_attempts=config.job_max_attempts,
+    )
+    console.print(
+        f"[green]housekeep[/green] retried={stats['retried']} "
+        f"archived={stats['archived']} orphans={stats['orphans_cancelled']}"
+    )
+    if stats["retry_ids"]:
+        console.print(f"  retry ids: {stats['retry_ids'][:20]}")
+    if stats["archived_ids"]:
+        console.print(f"  archived ids: {stats['archived_ids'][:20]}…")
 
 
 @queue_group.command("show")

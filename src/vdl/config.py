@@ -56,6 +56,21 @@ SUPERVISOR_ENABLED = os.environ.get("VDL_SUPERVISOR", "1").strip() not in {
 # Queue list: show done jobs only if recent (minutes) or latest of each kind.
 LIST_DONE_MINUTES = float(os.environ.get("VDL_LIST_DONE_MINUTES", "10"))
 LIST_LIMIT = int(os.environ.get("VDL_LIST_LIMIT", "30"))
+# Max attempts per job (1 try + retries). Default 3 = up to 2 automatic retries.
+JOB_MAX_ATTEMPTS = max(1, int(os.environ.get("VDL_JOB_MAX_ATTEMPTS", "3")))
+# Terminal jobs (done/failed/cancelled) older than this are archived (minutes).
+JOB_ARCHIVE_MINUTES = float(os.environ.get("VDL_JOB_ARCHIVE_MINUTES", "60"))
+# How long failed/cancelled stay visible in the default list (minutes).
+LIST_FAILED_MINUTES = float(os.environ.get("VDL_LIST_FAILED_MINUTES", "30"))
+LIST_CANCELLED_MINUTES = float(os.environ.get("VDL_LIST_CANCELLED_MINUTES", "10"))
+# Cool-down before housekeep auto-retries a failed job (minutes).
+JOB_HOUSEKEEP_RETRY_AFTER_MIN = float(
+    os.environ.get("VDL_JOB_HOUSEKEEP_RETRY_AFTER_MIN", "5")
+)
+# Auto-retry retryable failures once before archive (1=on).
+JOB_HOUSEKEEP_AUTO_RETRY = os.environ.get(
+    "VDL_JOB_HOUSEKEEP_AUTO_RETRY", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 class Config:
@@ -77,6 +92,27 @@ class Config:
         self.supervisor_enabled = SUPERVISOR_ENABLED
         self.list_done_minutes = LIST_DONE_MINUTES
         self.list_limit = max(1, LIST_LIMIT)
+        self.list_failed_minutes = float(
+            os.environ.get("VDL_LIST_FAILED_MINUTES", str(LIST_FAILED_MINUTES))
+        )
+        self.list_cancelled_minutes = float(
+            os.environ.get("VDL_LIST_CANCELLED_MINUTES", str(LIST_CANCELLED_MINUTES))
+        )
+        self.job_max_attempts = max(
+            1, int(os.environ.get("VDL_JOB_MAX_ATTEMPTS", str(JOB_MAX_ATTEMPTS)))
+        )
+        self.job_archive_minutes = float(
+            os.environ.get("VDL_JOB_ARCHIVE_MINUTES", str(JOB_ARCHIVE_MINUTES))
+        )
+        self.job_housekeep_retry_after_min = float(
+            os.environ.get(
+                "VDL_JOB_HOUSEKEEP_RETRY_AFTER_MIN", str(JOB_HOUSEKEEP_RETRY_AFTER_MIN)
+            )
+        )
+        self.job_housekeep_auto_retry = os.environ.get(
+            "VDL_JOB_HOUSEKEEP_AUTO_RETRY",
+            "1" if JOB_HOUSEKEEP_AUTO_RETRY else "0",
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
     def ensure_dirs(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)

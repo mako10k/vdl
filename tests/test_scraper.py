@@ -65,6 +65,28 @@ def test_classify_media_url_strict() -> None:
     assert classify_media_url("https://x/blob", mime="video/mp4") == "video"
     assert classify_media_url("https://x/page.html", mime="video/mp4") is None
     assert classify_media_url("https://x/a", mime="text/html") is None
+    # image ext never becomes video even with wrong type=video/*
+    assert classify_media_url("https://x/thumb.jpg", mime="video/mp4") is None
+    assert classify_media_url("https://x/a.png", mime="video/webm") is None
+    assert classify_media_url("https://x/p.webp") is None
+    # real media wins over wrong image MIME
+    assert classify_media_url("https://x/a.mp4", mime="image/jpeg") == "video"
+
+
+def test_rejects_image_source_with_video_type() -> None:
+    html = """
+    <video poster="https://cdn.example.com/p.jpg" src="https://cdn.example.com/ok.mp4">
+      <source src="https://cdn.example.com/wrong.jpg" type="video/mp4"/>
+      <source src="https://cdn.example.com/ok2.webm" type="video/webm"/>
+    </video>
+    <picture><source src="https://cdn.example.com/pic.jpg" type="image/jpeg"/></picture>
+    <a href="https://cdn.example.com/cover.jpg">cover</a>
+    """
+    cands = extract_candidates(html, "https://example.com/")
+    urls = {c.url for c in cands}
+    assert "https://cdn.example.com/ok.mp4" in urls
+    assert "https://cdn.example.com/ok2.webm" in urls
+    assert not any(u.endswith((".jpg", ".jpeg", ".png", ".webp")) for u in urls)
 
 
 def test_dedupe_normalized() -> None:

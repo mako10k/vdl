@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "vdl",
+  "version": "0.2.1",
+  "description": "Detect in-page video/m3u8, enqueue to local vdl, open Web console.",
+  "action": {
+    "default_title": "vdl",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "storage",
+    "notifications",
+    "tabs",
+    "webRequest",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:18765/*",
+    "http://localhost:18765/*",
+    "http://127.0.0.1:18766/*",
+    "http://localhost:18766/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

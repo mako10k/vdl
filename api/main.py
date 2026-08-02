@@ -9,6 +9,9 @@ Run:
 from __future__ import annotations
 
 import os
+import secrets
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -84,6 +87,36 @@ class SimilarSearchBody(BaseModel):
     by_scene: bool = False
 
 
+class BridgeItem(BaseModel):
+    url: str
+    kind: str = "video"
+    source: str = "extension"
+    title: str | None = None
+    mime: str | None = None
+
+
+class BridgePushBody(BaseModel):
+    """Chrome extension → Web UI handoff payload."""
+
+    page_url: str | None = None
+    items: list[BridgeItem] = Field(default_factory=list)
+    tab: str = "candidates"
+    note: str | None = None
+
+
+# In-memory bridge for extension ↔ Web UI (short TTL).
+_BRIDGE: dict[str, dict[str, Any]] = {}
+_BRIDGE_LOCK = threading.Lock()
+_BRIDGE_TTL_SEC = int(os.environ.get("VDL_BRIDGE_TTL_SEC", "900"))
+
+
+def _bridge_purge_locked() -> None:
+    now = time.time()
+    dead = [k for k, v in _BRIDGE.items() if float(v.get("expires", 0)) < now]
+    for k in dead:
+        del _BRIDGE[k]
+
+
 # ---------------------------------------------------------------------------
 # routes
 # ---------------------------------------------------------------------------
@@ -112,11 +145,25 @@ def info() -> dict[str, Any]:
 @app.get("/api/status")
 def status() -> dict[str, Any]:
     cfg = get_config()
+    q = JobQueue(cfg.db_path)
     return {
         "supervisor": supervisor_status(cfg),
         "worker": daemon_status(cfg),
-        "queue_counts": JobQueue(cfg.db_path).counts(),
+        "queue_counts": q.counts(include_archived=False),
+        "queue_counts_all": q.counts(include_archived=True),
     }
+
+
+@app.post("/api/queue/housekeep")
+def queue_housekeep() -> dict[str, Any]:
+    cfg = get_config()
+    q = JobQueue(cfg.db_path)
+    return q.housekeep(
+        archive_after_minutes=cfg.job_archive_minutes,
+        retry_after_minutes=cfg.job_housekeep_retry_after_min,
+        auto_retry=cfg.job_housekeep_auto_retry,
+        max_attempts=cfg.job_max_attempts,
+    )
 
 
 @app.get("/api/queue")
@@ -136,10 +183,14 @@ def queue_list(
         kind=kind,
         limit=lim,
         done_within_minutes=mins,
-        include_all_done=all_done or (status == "done"),
+        failed_within_minutes=cfg.list_failed_minutes,
+        cancelled_within_minutes=cfg.list_cancelled_minutes,
+        include_all_done=all_done
+        or (status in ("done", "failed", "cancelled", "archived") if status else False),
     )
     return {
-        "counts": q.counts(),
+        "counts": q.counts(include_archived=False),
+        "counts_all": q.counts(include_archived=True),
         "meta": meta,
         "jobs": [_job_dict(j) for j in rows],
     }
@@ -232,7 +283,8 @@ def candidates(body: CandidatesBody) -> dict[str, Any]:
         except Exception as e:
             raise HTTPException(400, str(e)) from e
     items = []
-    for i, (c, existing) in enumerate(rows, start=1):
+    for i, row in enumerate(rows, start=1):
+        c = row.candidate
         items.append(
             {
                 "index": i,
@@ -241,12 +293,142 @@ def candidates(body: CandidatesBody) -> dict[str, Any]:
                 "source": c.source,
                 "title": c.title,
                 "mime": c.mime,
-                "downloaded": existing is not None,
-                "download_id": getattr(existing, "id", None) if existing else None,
-                "file_path": getattr(existing, "file_path", None) if existing else None,
+                "downloaded": row.completed,
+                "known": row.known,
+                "queued": row.queued,
+                "state": row.state_label,
+                "selected_by_default": row.default_selected,
+                "download_id": row.download_id,
+                "file_path": getattr(row.record, "file_path", None)
+                if row.record
+                else None,
+                "registry_status": row.registry_status,
             }
         )
     return {"page_url": page_url, "count": len(items), "candidates": items}
+
+
+@app.post("/api/bridge/push")
+def bridge_push(body: BridgePushBody) -> dict[str, Any]:
+    """Store media candidates from the extension; Web UI pulls by token."""
+    items_in = [i for i in body.items if (i.url or "").strip()]
+    if not items_in and not body.page_url:
+        raise HTTPException(400, "items or page_url required")
+
+    # Dedupe by URL (keep first)
+    seen: set[str] = set()
+    uniq: list[BridgeItem] = []
+    for it in items_in:
+        u = it.url.strip()
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(it.model_copy(update={"url": u}))
+
+    from vdl.scraper import MediaCandidate, classify_media_url
+    from vdl.service import DownloadService
+
+    cfg = get_config()
+    # Drop non-media (e.g. .jpg even with type=video/*) and re-classify
+    fake: list[MediaCandidate] = []
+    seen_norm: set[str] = set()
+    for it in uniq:
+        kind = classify_media_url(it.url, mime=it.mime)
+        if kind is None and it.kind == "m3u8":
+            # content-type HLS without extension: allow only with mpegurl mime
+            kind = classify_media_url(
+                it.url,
+                mime=it.mime or "application/vnd.apple.mpegurl",
+            )
+        if kind is None:
+            continue
+        from vdl.util import normalize_url as _nu
+
+        key = _nu(it.url)
+        if key in seen_norm:
+            continue
+        seen_norm.add(key)
+        fake.append(
+            MediaCandidate(
+                url=it.url,
+                kind=kind,
+                source=it.source or "extension",
+                title=it.title,
+                mime=it.mime,
+            )
+        )
+
+    svc = DownloadService(cfg)
+    rows = svc.annotate_candidates(fake)
+    candidates: list[dict[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        c = row.candidate
+        candidates.append(
+            {
+                "index": i,
+                "url": c.url,
+                "kind": c.kind,
+                "source": c.source,
+                "title": c.title,
+                "mime": c.mime,
+                "downloaded": row.completed,
+                "known": row.known,
+                "queued": row.queued,
+                "state": row.state_label,
+                "selected_by_default": row.default_selected,
+                "download_id": row.download_id,
+                "file_path": getattr(row.record, "file_path", None)
+                if row.record
+                else None,
+                "registry_status": row.registry_status,
+            }
+        )
+
+    token = secrets.token_urlsafe(12)
+    tab = (body.tab or "candidates").strip() or "candidates"
+    payload = {
+        "token": token,
+        "page_url": body.page_url,
+        "candidates": candidates,
+        "count": len(candidates),
+        "tab": tab,
+        "note": body.note,
+        "created_at": time.time(),
+        "expires": time.time() + _BRIDGE_TTL_SEC,
+        "from": "extension",
+    }
+    with _BRIDGE_LOCK:
+        _bridge_purge_locked()
+        _BRIDGE[token] = payload
+
+    return {
+        "token": token,
+        "count": len(candidates),
+        "tab": tab,
+        "ttl_sec": _BRIDGE_TTL_SEC,
+        "ui_query": f"vdl_bridge={token}&tab={tab}",
+    }
+
+
+@app.get("/api/bridge/pull")
+def bridge_pull(
+    token: str = Query(..., min_length=4),
+    consume: bool = Query(False, description="Delete after read"),
+) -> dict[str, Any]:
+    """Web UI fetches extension-pushed candidates."""
+    with _BRIDGE_LOCK:
+        _bridge_purge_locked()
+        payload = _BRIDGE.get(token)
+        if not payload:
+            raise HTTPException(404, "bridge token not found or expired")
+        if consume:
+            del _BRIDGE[token]
+        else:
+            # refresh TTL on read so UI can re-mount once
+            payload["expires"] = time.time() + _BRIDGE_TTL_SEC
+        out = dict(payload)
+    out.pop("expires", None)
+    return out
 
 
 @app.get("/api/registry")
@@ -263,6 +445,7 @@ def registry_list(
         d = _download_dict(r)
         if r.status == "completed":
             d["index"] = q.index_status_for_download(r.id)
+            d["preview_url"] = _preview_url_for_download(cfg, q, r.id)
         out.append(d)
     return {"downloads": out}
 
@@ -276,11 +459,29 @@ def registry_show(download_id: int) -> dict[str, Any]:
     if not rec:
         raise HTTPException(404, f"download {download_id} not found")
     d = _download_dict(rec)
-    d["scenes"] = q.list_scenes(download_id)
+    scenes = q.list_scenes(download_id)
+    d["scenes"] = [_scene_dict(s, download_id, cfg=cfg) for s in scenes]
     d["embeddings"] = q.list_embeddings(download_id)
     if rec.status == "completed":
         d["index"] = q.index_status_for_download(download_id)
+    d["preview_url"] = _preview_url_for_download(cfg, q, download_id)
     return d
+
+
+@app.get("/api/registry/{download_id}/preview")
+def registry_preview(download_id: int):
+    """First available keyframe for a download (thumbnail)."""
+    cfg = get_config()
+    path = _resolve_preview_path(cfg, download_id, scene_index=None)
+    return FileResponse(path, media_type="image/jpeg", filename=path.name)
+
+
+@app.get("/api/registry/{download_id}/scenes/{scene_index}/keyframe")
+def registry_scene_keyframe(download_id: int, scene_index: int):
+    """Keyframe JPEG for a specific scene."""
+    cfg = get_config()
+    path = _resolve_preview_path(cfg, download_id, scene_index=scene_index)
+    return FileResponse(path, media_type="image/jpeg", filename=path.name)
 
 
 @app.post("/api/registry/{download_id}/reindex")
@@ -307,7 +508,7 @@ def search_text(body: TextSearchBody) -> dict[str, Any]:
         )
     except Exception as e:
         raise HTTPException(400, str(e)) from e
-    return {"hits": [_hit_dict(h) for h in hits]}
+    return {"hits": [_hit_dict(h, with_preview=True) for h in hits]}
 
 
 @app.post("/api/search/similar")
@@ -323,12 +524,12 @@ def search_similar(body: SimilarSearchBody) -> dict[str, Any]:
         )
     except Exception as e:
         raise HTTPException(400, str(e)) from e
-    return {"hits": [_hit_dict(h) for h in hits]}
+    return {"hits": [_hit_dict(h, with_preview=True) for h in hits]}
 
 
 @app.get("/api/files/{download_id}")
 def file_download(download_id: int):
-    """Stream registered media file if it exists on disk."""
+    """Stream registered media file if it exists on disk (supports Range for seeking)."""
     cfg = get_config()
     rec = Registry(cfg.db_path).get(download_id)
     if not rec or not rec.file_path:
@@ -336,7 +537,16 @@ def file_download(download_id: int):
     path = Path(rec.file_path)
     if not path.is_file():
         raise HTTPException(404, f"missing on disk: {path}")
-    return FileResponse(path, filename=path.name)
+    suffix = path.suffix.lower()
+    media = {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".mov": "video/quicktime",
+        ".m4v": "video/mp4",
+        ".ts": "video/mp2t",
+    }.get(suffix)
+    return FileResponse(path, filename=path.name, media_type=media)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +562,7 @@ def _job_dict(j) -> dict[str, Any]:
         "status": j.status,
         "download_id": j.download_id,
         "depends_on_job_id": j.depends_on_job_id,
+        "attempts": getattr(j, "attempts", 0) or 0,
         "progress_pct": j.progress_pct,
         "progress_msg": j.progress_msg,
         "progress_current": j.progress_current,
@@ -387,8 +598,8 @@ def _download_dict(r) -> dict[str, Any]:
     }
 
 
-def _hit_dict(h) -> dict[str, Any]:
-    return {
+def _hit_dict(h, *, with_preview: bool = False) -> dict[str, Any]:
+    d: dict[str, Any] = {
         "rank": h.rank,
         "download_id": h.download_id,
         "scene_id": h.scene_id,
@@ -403,6 +614,93 @@ def _hit_dict(h) -> dict[str, Any]:
         "start_sec": h.start_sec,
         "end_sec": h.end_sec,
     }
+    if with_preview and h.download_id is not None and h.download_id >= 0:
+        if h.scene_index is not None:
+            d["preview_url"] = (
+                f"/api/registry/{h.download_id}/scenes/{h.scene_index}/keyframe"
+            )
+        else:
+            d["preview_url"] = f"/api/registry/{h.download_id}/preview"
+    return d
+
+
+def _scene_dict(
+    s: dict[str, Any], download_id: int, *, cfg: Config | None = None
+) -> dict[str, Any]:
+    idx = s.get("scene_index")
+    out = dict(s)
+    if idx is not None:
+        out["keyframe_url"] = f"/api/registry/{download_id}/scenes/{idx}/keyframe"
+    has = bool(s.get("keyframe_path") and Path(str(s["keyframe_path"])).is_file())
+    if not has and cfg is not None and idx is not None:
+        cand = cfg.keyframes_dir / f"dl_{download_id}" / f"scene{int(idx):04d}_key.jpg"
+        has = cand.is_file()
+    out["has_keyframe"] = has
+    return out
+
+
+def _preview_url_for_download(cfg: Config, q: JobQueue, download_id: int) -> str | None:
+    try:
+        path = _resolve_preview_path(cfg, download_id, scene_index=None)
+    except HTTPException:
+        return None
+    if path and path.is_file():
+        return f"/api/registry/{download_id}/preview"
+    return None
+
+
+def _resolve_preview_path(
+    cfg: Config,
+    download_id: int,
+    *,
+    scene_index: int | None,
+) -> Path:
+    """Resolve a keyframe path under VDL home (safe path check)."""
+    q = JobQueue(cfg.db_path)
+    rec = Registry(cfg.db_path).get(download_id)
+    if not rec:
+        raise HTTPException(404, f"download {download_id} not found")
+
+    scenes = q.list_scenes(download_id)
+    path: Path | None = None
+
+    if scene_index is not None:
+        for s in scenes:
+            if s.get("scene_index") == scene_index:
+                kp = s.get("keyframe_path")
+                if kp and Path(kp).is_file():
+                    path = Path(kp)
+                break
+        if path is None:
+            # fallback conventional path (clip job may leave files without DB path)
+            cand = cfg.keyframes_dir / f"dl_{download_id}" / f"scene{scene_index:04d}_key.jpg"
+            if cand.is_file():
+                path = cand
+    else:
+        # first scene with keyframe on disk
+        for s in sorted(scenes, key=lambda x: x.get("scene_index") or 0):
+            kp = s.get("keyframe_path")
+            if kp and Path(kp).is_file():
+                path = Path(kp)
+                break
+        if path is None:
+            ddir = cfg.keyframes_dir / f"dl_{download_id}"
+            if ddir.is_dir():
+                keys = sorted(ddir.glob("scene*_key.jpg"))
+                if keys:
+                    path = keys[0]
+
+    if path is None or not path.is_file():
+        raise HTTPException(404, "keyframe not found (reindex may be required)")
+
+    # Security: must be under VDL home (keyframes or downloads)
+    try:
+        resolved = path.resolve()
+        home = cfg.home.resolve()
+        resolved.relative_to(home)
+    except Exception as e:
+        raise HTTPException(403, "path outside VDL_HOME") from e
+    return resolved
 
 
 def main() -> None:

@@ -18,6 +18,7 @@ from vdl.m3u8_dl import (
     download_m3u8_ffmpeg,
     parse_m3u8,
 )
+from vdl.queue import JobQueue
 from vdl.registry import Registry, SourceType
 from vdl.scraper import MediaCandidate, extract_candidates
 from vdl.util import (
@@ -41,6 +42,73 @@ class ActionResult:
     message: str
     path: Optional[Path] = None
     record_id: Optional[int] = None
+
+
+@dataclass
+class CandidateRow:
+    """One scrape hit annotated with registry / queue state."""
+
+    candidate: MediaCandidate
+    record: object | None = None
+    queued: bool = False
+
+    @property
+    def url(self) -> str:
+        return self.candidate.url
+
+    @property
+    def kind(self) -> str:
+        return self.candidate.kind
+
+    @property
+    def source(self) -> str:
+        return self.candidate.source
+
+    @property
+    def title(self) -> str | None:
+        return self.candidate.title
+
+    @property
+    def mime(self) -> str | None:
+        return self.candidate.mime
+
+    @property
+    def download_id(self) -> int | None:
+        return getattr(self.record, "id", None) if self.record else None
+
+    @property
+    def registry_status(self) -> str | None:
+        return getattr(self.record, "status", None) if self.record else None
+
+    @property
+    def completed(self) -> bool:
+        return bool(self.record and getattr(self.record, "status", None) == "completed")
+
+    @property
+    def known(self) -> bool:
+        """Already in registry (any status) or actively queued."""
+        return self.record is not None or self.queued
+
+    @property
+    def default_selected(self) -> bool:
+        """True only for actionable new items (past / queue unchecked)."""
+        if self.known:
+            return False
+        if is_mpd_url(self.candidate.url):
+            return False
+        return True
+
+    @property
+    def state_label(self) -> str:
+        if self.completed:
+            return "completed"
+        if self.queued:
+            return "queued"
+        if self.record is not None:
+            return str(self.registry_status or "known")
+        if is_mpd_url(self.candidate.url):
+            return "unsupported"
+        return "new"
 
 
 class DownloadService:
@@ -502,11 +570,40 @@ class DownloadService:
     # HTML scrape
     # ------------------------------------------------------------------
 
+    def annotate_candidates(
+        self, candidates: list[MediaCandidate]
+    ) -> list[CandidateRow]:
+        """
+        Dedupe (already unique by normalize_url in scraper) and annotate with
+        registry history + active download jobs so past/queued items are not
+        default-selected.
+        """
+        queued_urls = JobQueue(self.config.db_path).active_download_urls()
+        rows: list[CandidateRow] = []
+        seen: set[str] = set()
+        for c in candidates:
+            key = normalize_url(c.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            # any registry row (completed / pending / failed) counts as past
+            record = self.registry.find_by_url(key, completed_only=False)
+            if record is None:
+                record = self.registry.is_downloaded(key)
+            rows.append(
+                CandidateRow(
+                    candidate=c,
+                    record=record,
+                    queued=key in queued_urls,
+                )
+            )
+        return rows
+
     def fetch_html_candidates(
         self, page_url: str
-    ) -> tuple[str, list[tuple[MediaCandidate, object | None]]]:
+    ) -> tuple[str, list[CandidateRow]]:
         """
-        Fetch page and return (final_page_url, [(candidate, registry_record_or_None)]).
+        Fetch page and return (final_page_url, annotated candidate rows).
         Recurses into iframes (HTML) to find nested media.
         """
         r = self.client.get(
@@ -548,35 +645,42 @@ class DownloadService:
             iframe_depth=1,
             max_iframes=8,
         )
-        rows: list[tuple[MediaCandidate, object | None]] = []
-        for c in candidates:
-            existing = self.registry.is_downloaded(normalize_url(c.url))
-            rows.append((c, existing))
-        return final, rows
+        return final, self.annotate_candidates(candidates)
 
     def print_candidates_table(
         self,
         page_url: str,
-        rows: list[tuple[MediaCandidate, object | None]],
+        rows: list[CandidateRow],
     ) -> None:
         table = Table(title=f"メディア候補 ({len(rows)}) — {page_url}")
         table.add_column("#", style="bold", width=4)
-        table.add_column("状態", width=14)
+        table.add_column("状態", width=16)
+        table.add_column("既定", width=6)
         table.add_column("種別", width=8)
         table.add_column("ソース", width=12)
         table.add_column("URL / タイトル")
-        for i, (c, existing) in enumerate(rows, start=1):
-            if existing is not None:
-                status = f"[yellow]済 id={getattr(existing, 'id', '?')}[/yellow]"
+        for i, row in enumerate(rows, start=1):
+            c = row.candidate
+            if row.completed:
+                status = f"[yellow]済 id={row.download_id}[/yellow]"
+            elif row.queued:
+                status = "[cyan]キュー中[/cyan]"
+            elif row.record is not None:
+                status = (
+                    f"[yellow]登録 {row.registry_status} "
+                    f"id={row.download_id}[/yellow]"
+                )
             elif is_mpd_url(c.url):
                 status = "[red]非対応[/red]"
             else:
                 status = "[green]新規[/green]"
+            default = "[green]on[/green]" if row.default_selected else "[dim]off[/dim]"
             title_bit = f"\n  {c.title}" if c.title else ""
             note = " [MPD=MVP外]" if is_mpd_url(c.url) else ""
             table.add_row(
                 str(i),
                 status,
+                default,
                 c.kind,
                 c.source,
                 c.url + note + title_bit,
@@ -587,8 +691,8 @@ class DownloadService:
             "または vdl candidates '<page>' --enqueue[/dim]"
         )
         console.print(
-            "[dim]  -y / --all で選択省略（--enqueue と併用）。"
-            "番号指定は対話時のみ。[/dim]"
+            "[dim]  -y は「新規」のみ（済・登録済・キュー中は除外）。"
+            "--all で全件。対話時の new も新規のみ。[/dim]"
         )
 
     def _handle_html(
@@ -621,16 +725,7 @@ class DownloadService:
                 )
             ]
 
-        def _is_actionable(c: MediaCandidate, existing: object | None) -> bool:
-            if existing is not None:
-                return False
-            if is_mpd_url(c.url):
-                return False
-            return True
-
-        new_indices = [
-            i for i, (c, ex) in enumerate(rows) if _is_actionable(c, ex)
-        ]
+        new_indices = [i for i, row in enumerate(rows) if row.default_selected]
         if select_all:
             chosen_idx = list(range(len(rows)))
         elif auto_yes:
@@ -642,7 +737,7 @@ class DownloadService:
                 return [
                     ActionResult(
                         status="skipped",
-                        message="新規候補なし（済または MVP 非対応のみ）",
+                        message="新規候補なし（済・登録済・キュー中または MVP 非対応のみ）",
                     )
                 ]
         else:
@@ -652,18 +747,29 @@ class DownloadService:
 
         results: list[ActionResult] = []
         for i in chosen_idx:
-            c, existing = rows[i]
-            if existing and not self.force:
-                console.print(
-                    f"[yellow]#{i+1} スキップ[/yellow] 既にダウンロード済み "
-                    f"(id={existing.id}, {existing.file_path})"
+            row = rows[i]
+            c = row.candidate
+            if row.known and not self.force:
+                reason = (
+                    f"済 id={row.download_id}"
+                    if row.completed
+                    else (
+                        f"キュー中"
+                        if row.queued
+                        else f"登録済 {row.registry_status} id={row.download_id}"
+                    )
                 )
+                console.print(f"[yellow]#{i+1} スキップ[/yellow] {reason}")
                 results.append(
                     ActionResult(
                         status="skipped",
-                        message=f"済: {existing.file_path}",
-                        path=Path(existing.file_path) if existing.file_path else None,
-                        record_id=existing.id,
+                        message=reason,
+                        path=(
+                            Path(row.record.file_path)
+                            if row.record and getattr(row.record, "file_path", None)
+                            else None
+                        ),
+                        record_id=row.download_id,
                     )
                 )
                 continue
@@ -680,27 +786,18 @@ class DownloadService:
 
     def select_candidate_indices(
         self,
-        rows: list[tuple[MediaCandidate, object | None]],
+        rows: list[CandidateRow],
         *,
         select_all: bool = False,
         auto_yes: bool = False,
         interactive: bool = True,
     ) -> list[int] | None:
         """Return 0-based indices to act on, or None if cancelled."""
-
-        def _is_actionable(c: MediaCandidate, existing: object | None) -> bool:
-            if existing is not None and not self.force:
-                return False
-            if is_mpd_url(c.url):
-                return False
-            return True
-
-        new_indices = [
-            i for i, (c, ex) in enumerate(rows) if _is_actionable(c, ex)
-        ]
+        new_indices = [i for i, row in enumerate(rows) if row.default_selected]
         if select_all:
             return list(range(len(rows)))
         if auto_yes:
+            # -y: only new (past / queued remain unchecked)
             return new_indices if new_indices else []
         if not interactive:
             return []

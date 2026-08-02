@@ -72,6 +72,52 @@ _PAGE_EXTENSIONS = {
     ".gz",
 }
 
+# Images / non-AV assets — never promote to video even if type="video/*"
+_NON_MEDIA_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".ico",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".heif",
+    ".avif",
+    ".svg",
+    ".css",
+    ".js",
+    ".mjs",
+    ".map",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".vtt",
+    ".srt",
+    ".ass",
+    ".ssa",
+}
+
+# Prefer more specific discovery sources when the same URL is seen twice
+_SOURCE_RANK: dict[str, int] = {
+    "video_tag": 10,
+    "source_tag": 20,
+    "audio_tag": 25,
+    "iframe": 30,
+    "embed": 35,
+    "object": 36,
+    "meta": 40,
+    "jsonld": 45,
+    "anchor": 50,
+    "script_json": 60,
+    "script": 70,
+    "page_text": 90,
+}
+
 _INDEX_MIME = {
     "application/vnd.apple.mpegurl",
     "application/x-mpegurl",
@@ -156,6 +202,46 @@ def _is_page_like_url(url: str) -> bool:
     return False
 
 
+def _mime_main(mime: str | None) -> str:
+    if not mime:
+        return ""
+    return mime.split(";", 1)[0].strip().lower()
+
+
+def _is_image_or_doc_mime(mime_main: str) -> bool:
+    if not mime_main:
+        return False
+    if mime_main.startswith("image/"):
+        return True
+    return mime_main in {
+        "text/html",
+        "application/xhtml+xml",
+        "text/plain",
+        "text/css",
+        "application/javascript",
+        "text/javascript",
+        "application/json",
+        "font/woff",
+        "font/woff2",
+        "application/font-woff",
+        "application/font-woff2",
+    }
+
+
+def _source_base(source: str) -> str:
+    """Strip iframe> prefixes for ranking."""
+    if ">" in source:
+        source = source.rsplit(">", 1)[-1]
+    if ":" in source and not source.startswith("http"):
+        # e.g. prefix:video_tag from nested scrape — keep last token
+        source = source.rsplit(":", 1)[-1]
+    return source
+
+
+def _source_rank(source: str) -> int:
+    return _SOURCE_RANK.get(_source_base(source), 80)
+
+
 def classify_media_url(
     url: str,
     *,
@@ -163,58 +249,50 @@ def classify_media_url(
 ) -> str | None:
     """
     Return 'video' | 'index' | None.
-    Prefer last-path-segment extension; MIME only for non-HTML types.
-    Never accepts text/html or page-like paths as media.
+
+    Rules (strict):
+    - Last path-segment extension is authoritative for known media / non-media.
+    - Image/document extensions (.jpg, .png, …) are NEVER media, even if
+      ``type="video/mp4"`` is set on a ``<source>`` tag (common poster mistake).
+    - Real media extensions (.mp4, .m3u8, …) win even if MIME is wrong/missing.
+    - MIME is only used when the path has no usable media/non-media extension
+      (CDN blob URLs without an extension).
     """
     if not url or url.startswith(("data:", "javascript:", "blob:", "#")):
         return None
 
-    mime_main = ""
-    if mime:
-        mime_main = mime.split(";", 1)[0].strip().lower()
-        if mime_main in {
-            "text/html",
-            "application/xhtml+xml",
-            "text/plain",
-            "text/css",
-            "application/javascript",
-            "text/javascript",
-            "application/json",
-            "image/jpeg",
-            "image/png",
-            "image/gif",
-            "image/webp",
-            "image/svg+xml",
-        }:
-            return None
-
+    mime_main = _mime_main(mime)
     ext = _segment_extension(url)
-    # Explicit media extensions win
+
+    # Hard reject non-media / page extensions (tag MIME cannot override)
+    if ext in _NON_MEDIA_EXTENSIONS or ext in _PAGE_EXTENSIONS:
+        return None
+
+    # Explicit media extensions win over wrong MIME (e.g. type=image/jpeg on .mp4)
     if ext in _MEDIA_INDEX_EXT:
         return "index"
     if ext in _MEDIA_VIDEO_EXT:
         return "video"
 
-    # .m3u8 sometimes appears as .../index.m3u8/extra — rare; check path contains
+    # path ends with media ext even with odd trailing segments
     path_l = (urlparse(url).path or "").lower()
     if path_l.endswith(".m3u8") or path_l.endswith(".m3u") or path_l.endswith(".mpd"):
         return "index"
 
-    # MIME without extension (blob CDN) — only strong types
+    # Extensionless / unknown ext: use MIME carefully
     if mime_main:
+        if _is_image_or_doc_mime(mime_main):
+            return None
         if mime_main in _INDEX_MIME or "mpegurl" in mime_main:
-            # still reject if clearly a page path with html-like name
-            if ext in _PAGE_EXTENSIONS:
-                return None
             return "index"
         if mime_main.startswith(_VIDEO_MIME_PREFIXES) or mime_main in _VIDEO_MIME_EXACT:
-            if ext in _PAGE_EXTENSIONS:
+            # reject page-like paths even with video MIME
+            if _is_page_like_url(url):
                 return None
             return "video"
 
     # No extension + no strong mime → not a media candidate
-    # (prevents HTML player / "index" pages from being listed)
-    if _is_page_like_url(url) or ext in _PAGE_EXTENSIONS or ext == "":
+    if _is_page_like_url(url) or ext == "":
         return None
 
     return None
@@ -258,11 +336,16 @@ def _add(
         return
     key = normalize_url(abs_url)
     if key in found:
-        if title and not found[key].title:
-            found[key].title = title
-        if mime and not found[key].mime:
-            found[key].mime = mime
-        # prefer more specific source tags over page_text
+        prev = found[key]
+        if title and not prev.title:
+            prev.title = title
+        if mime and not prev.mime:
+            prev.mime = mime
+        # Prefer higher-quality discovery source; keep first URL string
+        if _source_rank(source) < _source_rank(prev.source):
+            prev.source = source
+            if extras:
+                prev.extras = {**prev.extras, **extras}
         return
     found[key] = MediaCandidate(
         url=abs_url,
@@ -315,6 +398,7 @@ def _extract_from_soup(
     iframe_pages: list[str] = []
 
     for video in soup.find_all("video"):
+        # poster= is intentionally ignored (almost always an image)
         if video.get("src"):
             _add(
                 found,
@@ -322,8 +406,10 @@ def _extract_from_soup(
                 page_url,
                 source=f"{pref}video_tag",
                 title=video.get("title") or page_title,
+                mime=video.get("type"),
             )
         for src in video.find_all("source"):
+            # type="image/*" or .jpg + type=video/* → rejected by classify
             _add(
                 found,
                 src.get("src"),
@@ -333,14 +419,28 @@ def _extract_from_soup(
                 mime=src.get("type"),
             )
 
-    for src in soup.find_all("source"):
-        _add(
-            found,
-            src.get("src"),
-            page_url,
-            source=f"{pref}source_tag",
-            mime=src.get("type"),
-        )
+    for audio in soup.find_all("audio"):
+        if audio.get("src"):
+            _add(
+                found,
+                audio["src"],
+                page_url,
+                source=f"{pref}audio_tag",
+                title=audio.get("title") or page_title,
+                mime=audio.get("type"),
+            )
+        for src in audio.find_all("source"):
+            _add(
+                found,
+                src.get("src"),
+                page_url,
+                source=f"{pref}source_tag",
+                title=audio.get("title") or page_title,
+                mime=src.get("type"),
+            )
+
+    # Note: bare <source> under <picture> is intentionally ignored (images).
+    # Media <source> is collected only via the video/audio loops above.
 
     for a in soup.find_all("a", href=True):
         href = a["href"]

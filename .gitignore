@@ -28,3 +28,7 @@ downloads/**/*.ts
 **/*.mpegts
 *.webm
 *.mkv
+
+# Chrome extension packaging secrets / binaries
+extension.pem
+extension.crx

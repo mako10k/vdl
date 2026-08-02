@@ -27,6 +27,7 @@ export type Job = {
   status: string
   download_id: number | null
   depends_on_job_id: number | null
+  attempts?: number
   progress_pct: number | null
   progress_msg: string | null
   progress_label: string
@@ -38,6 +39,16 @@ export type Job = {
   finished_at: string | null
 }
 
+export type Scene = {
+  id: number
+  scene_index: number
+  start_sec: number
+  end_sec: number
+  keyframe_path?: string | null
+  keyframe_url?: string
+  has_keyframe?: boolean
+}
+
 export type Download = {
   id: number
   url: string
@@ -47,6 +58,8 @@ export type Download = {
   file_path: string | null
   file_size: number | null
   error: string | null
+  preview_url?: string | null
+  scenes?: Scene[]
   index?: {
     overall_pct: number
     scenes: number
@@ -64,6 +77,14 @@ export type Candidate = {
   title: string | null
   downloaded: boolean
   download_id: number | null
+  /** True if registry has any row or an active download job */
+  known?: boolean
+  queued?: boolean
+  state?: string
+  /** CLI/UI: only new items are checked by default */
+  selected_by_default?: boolean
+  file_path?: string | null
+  registry_status?: string | null
 }
 
 export type SearchHit = {
@@ -78,6 +99,7 @@ export type SearchHit = {
   start_sec: number | null
   end_sec: number | null
   modality: string
+  preview_url?: string | null
 }
 
 export const api = {
@@ -120,8 +142,23 @@ export const api = {
       '/api/candidates',
       { method: 'POST', body: JSON.stringify({ url }) },
     ),
+  bridgePull: (token: string, consume = false) => {
+    const q = new URLSearchParams({ token })
+    if (consume) q.set('consume', 'true')
+    return req<{
+      token: string
+      page_url: string | null
+      candidates: Candidate[]
+      count: number
+      tab: string
+      note?: string | null
+      from?: string
+      created_at?: number
+    }>(`/api/bridge/pull?${q}`)
+  },
   registry: () => req<{ downloads: Download[] }>('/api/registry'),
-  registryShow: (id: number) => req<Download & { scenes?: unknown[] }>(`/api/registry/${id}`),
+  registryShow: (id: number) =>
+    req<Download & { scenes?: Scene[] }>(`/api/registry/${id}`),
   reindex: (id: number) =>
     req<{ jobs: Record<string, number> }>(`/api/registry/${id}/reindex`, {
       method: 'POST',
@@ -141,4 +178,7 @@ export const api = {
   cancel: (id: number) =>
     req<Job>(`/api/queue/${id}/cancel`, { method: 'POST' }),
   fileUrl: (downloadId: number) => `/api/files/${downloadId}`,
+  previewUrl: (downloadId: number) => `/api/registry/${downloadId}/preview`,
+  keyframeUrl: (downloadId: number, sceneIndex: number) =>
+    `/api/registry/${downloadId}/scenes/${sceneIndex}/keyframe`,
 }

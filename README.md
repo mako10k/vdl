@@ -106,6 +106,16 @@ export VDL_SUPERVISOR_IDLE_SEC=120
 export VDL_DAEMON_IDLE_SEC=120
 # 並列ワーカー数
 export VDL_DAEMON_WORKERS=3
+# ジョブ失敗時の最大試行回数（既定 3 = 初回+自動リトライ2回）。超過後は依存後続を自動キャンセル
+export VDL_JOB_MAX_ATTEMPTS=3
+# 終了ジョブ (done/failed/cancelled) をアーカイブするまでの分数（既定 60）
+export VDL_JOB_ARCHIVE_MINUTES=60
+# 一覧に残す failed / cancelled の分数
+export VDL_LIST_FAILED_MINUTES=30
+export VDL_LIST_CANCELLED_MINUTES=10
+# アーカイブ前にリトライ可能な失敗を自動リトライ（クールダウン分）
+export VDL_JOB_HOUSEKEEP_RETRY_AFTER_MIN=5
+export VDL_JOB_HOUSEKEEP_AUTO_RETRY=1
 
 # 自動起動したくないとき
 vdl get URL --no-daemon
@@ -138,6 +148,16 @@ vdl get 'https://example.com/a.mp4' --sync --no-index
 vdl queue reindex 1
 vdl daemon run   # フォアグラウンドで処理
 ```
+
+### Web UI / Chrome 拡張
+
+| 面 | 内容 |
+|----|------|
+| API | `python -m uvicorn api.main:app --host 127.0.0.1 --port 18765` |
+| Web console | `cd web && npm run dev` → `http://127.0.0.1:18766` |
+| Chrome 拡張 | [`extension/`](extension/) — ページ内動画検出 → DL 投入 / Console 連携（API+UI 起動前提） |
+
+拡張: 検出結果を `POST /api/bridge/push` し、Console は `?vdl_bridge=TOKEN&tab=candidates` で取り込み。手順は [`extension/README.md`](extension/README.md)。
 
 ## データ配置 (`~/.vdl` または `$VDL_HOME`)
 

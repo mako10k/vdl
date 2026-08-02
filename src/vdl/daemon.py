@@ -97,8 +97,10 @@ def _execute_job(config: Config, job: Job) -> tuple[int, str, str | None, dict |
     """
     Run one job in a worker thread.
     Returns (job_id, status, error_or_none, result_or_none).
+    status is done | failed | retry | reload.
     """
     queue = JobQueue(config.db_path)
+    max_attempts = int(getattr(config, "job_max_attempts", 3) or 3)
     try:
         result = run_job(config, job)
         queue.mark_done(job.id, result)
@@ -107,7 +109,14 @@ def _execute_job(config: Config, job: Job) -> tuple[int, str, str | None, dict |
         # Should only happen on main thread; treat as special.
         return job.id, "reload", None, e.result
     except Exception as e:
-        queue.mark_failed(job.id, str(e))
+        updated = queue.mark_failed(
+            job.id,
+            str(e),
+            max_attempts=max_attempts,
+            cancel_dependents=True,
+        )
+        if updated.status == "pending":
+            return job.id, "retry", str(e), None
         return job.id, "failed", str(e), None
 
 
@@ -177,12 +186,18 @@ def run_forever(
                 jid, status, err, _result = fut.result()
                 if status == "done":
                     logger.info("job done id=%s kind=%s", jid, job.kind)
+                elif status == "retry":
+                    logger.warning(
+                        "job auto-retry id=%s kind=%s: %s", jid, job.kind, err
+                    )
                 elif status == "reload":
                     logger.warning(
                         "reload raised from worker unexpectedly id=%s", jid
                     )
                 else:
-                    logger.error("job failed id=%s kind=%s: %s", jid, job.kind, err)
+                    logger.error(
+                        "job failed (final) id=%s kind=%s: %s", jid, job.kind, err
+                    )
             except Exception as e:
                 logger.exception("job future error id=%s: %s", job.id, e)
                 try:
@@ -224,6 +239,7 @@ def run_forever(
             max_workers=max_workers, thread_name_prefix="vdl-job"
         ) as pool:
             last_eta_refresh = 0.0
+            last_housekeep = 0.0
             while not state.stopping:
                 _drain_done()
 
@@ -235,6 +251,39 @@ def run_forever(
                     except Exception:
                         pass
                     last_eta_refresh = now_m
+
+                # Housekeep every ~30s: retry recoverable failures, archive old terminals
+                if now_m - last_housekeep >= 30.0:
+                    try:
+                        hk = queue.housekeep(
+                            archive_after_minutes=float(
+                                getattr(config, "job_archive_minutes", 60) or 60
+                            ),
+                            retry_after_minutes=float(
+                                getattr(config, "job_housekeep_retry_after_min", 5)
+                                or 5
+                            ),
+                            auto_retry=bool(
+                                getattr(config, "job_housekeep_auto_retry", True)
+                            ),
+                            max_attempts=int(
+                                getattr(config, "job_max_attempts", 3) or 3
+                            ),
+                        )
+                        if (
+                            hk.get("retried")
+                            or hk.get("archived")
+                            or hk.get("orphans_cancelled")
+                        ):
+                            logger.info(
+                                "housekeep retried=%s archived=%s orphans=%s",
+                                hk.get("retried"),
+                                hk.get("archived"),
+                                hk.get("orphans_cancelled"),
+                            )
+                    except Exception:
+                        logger.exception("housekeep failed")
+                    last_housekeep = now_m
 
                 # Job boundary: consider self-update gate
                 if not futures:
@@ -253,6 +302,7 @@ def run_forever(
                     continue
 
                 claimed_any = False
+
                 while len(futures) < max_workers and not state.stopping:
                     # When reload pending, claim only after idle workers
                     if reload_gate and futures:
