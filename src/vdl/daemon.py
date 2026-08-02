@@ -223,8 +223,18 @@ def run_forever(
         with ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="vdl-job"
         ) as pool:
+            last_eta_refresh = 0.0
             while not state.stopping:
                 _drain_done()
+
+                # Refresh ETA for running jobs every ~2s (for list/watch readers)
+                now_m = time.time()
+                if now_m - last_eta_refresh >= 2.0:
+                    try:
+                        queue.refresh_running_etas()
+                    except Exception:
+                        pass
+                    last_eta_refresh = now_m
 
                 # Job boundary: consider self-update gate
                 if not futures:

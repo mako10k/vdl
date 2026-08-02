@@ -449,16 +449,33 @@ class DownloadService:
         )
         try:
             segs = info.segment_count or "?"
-            self._phase(f"hls download (~{segs} segs)", 15.0)
+            dur = info.duration_approx
+            self._phase(f"hls download (~{segs} segs)", 10.0)
             console.print(
                 f"[cyan]HLS ダウンロード中[/cyan] segments≈{info.segment_count} "
-                f"duration≈{info.duration_approx or '?'}s → {title}"
+                f"duration≈{dur or '?'}s → {title}"
             )
+
+            def _hls_prog(out_t: float, dur_hint: float | None) -> None:
+                d = dur_hint or dur
+                if d and d > 0:
+                    # map media time into 10–92%
+                    frac = min(1.0, max(0.0, out_t / d))
+                    pct = 10.0 + 82.0 * frac
+                    self._phase(
+                        f"hls {out_t:.0f}/{d:.0f}s",
+                        pct,
+                    )
+                else:
+                    self._phase(f"hls t={out_t:.0f}s", None)
+
             path, size = download_m3u8_ffmpeg(
                 info.media_playlist_url,
                 self.config.download_dir,
                 filename=title,
                 headers=self.headers or None,
+                duration_hint=dur,
+                on_progress=_hls_prog,
             )
             self._phase("hashing", 95.0)
             digest = sha256_file(path)

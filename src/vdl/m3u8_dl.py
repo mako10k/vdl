@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 from urllib.parse import urljoin
 from urllib.request import pathname2url
 
@@ -14,6 +15,9 @@ import httpx
 import m3u8
 
 from vdl.util import is_mpd_url, safe_filename, sha256_text, unique_path
+
+# out_time_sec, duration_hint_or_None
+FFmpegProgressCb = Callable[[float, Optional[float]], None]
 
 
 class UnsupportedIndexError(ValueError):
@@ -252,9 +256,14 @@ def download_m3u8_ffmpeg(
     filename: str | None = None,
     headers: dict[str, str] | None = None,
     ffmpeg_bin: str = "ffmpeg",
+    duration_hint: float | None = None,
+    on_progress: FFmpegProgressCb | None = None,
 ) -> tuple[Path, int]:
     """
     Download HLS via ffmpeg (-c copy). Returns (path, size).
+
+    on_progress(out_time_sec, duration_hint_or_None) is called as ffmpeg reports
+    progress (about every second with -progress).
     """
     if not shutil.which(ffmpeg_bin):
         raise RuntimeError(
@@ -271,46 +280,87 @@ def download_m3u8_ffmpeg(
     # Build ffmpeg headers string (CRLF separated)
     header_args: list[str] = []
     if headers:
-        # ffmpeg -headers "Key: Value\r\nKey2: Value2\r\n"
         lines = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         header_args = ["-headers", lines]
 
-    cmd = [
-        ffmpeg_bin,
-        "-y",
-        "-loglevel",
-        "warning",
-        "-stats",
-        *header_args,
-        "-i",
-        media_playlist_url,
-        "-c",
-        "copy",
-        "-bsf:a",
-        "aac_adtstoasc",
-        str(out_path),
-    ]
-
-    # aac_adtstoasc can fail on non-AAC audio; retry without bsf
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError:
-        if out_path.exists():
-            out_path.unlink(missing_ok=True)
-        cmd_simple = [
+    def _run(with_bsf: bool) -> None:
+        cmd = [
             ffmpeg_bin,
             "-y",
+            "-nostats",
             "-loglevel",
-            "warning",
-            "-stats",
+            "error",
+            "-progress",
+            "pipe:1",
             *header_args,
             "-i",
             media_playlist_url,
             "-c",
             "copy",
-            str(out_path),
         ]
-        subprocess.run(cmd_simple, check=True)
+        if with_bsf:
+            cmd.extend(["-bsf:a", "aac_adtstoasc"])
+        cmd.append(str(out_path))
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        last_report = 0.0
+        out_time = 0.0
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                if key == "out_time_ms":
+                    try:
+                        out_time = max(0.0, int(val) / 1_000_000.0)
+                    except ValueError:
+                        continue
+                elif key == "out_time":
+                    # HH:MM:SS.micro
+                    try:
+                        parts = val.split(":")
+                        if len(parts) == 3:
+                            out_time = (
+                                int(parts[0]) * 3600
+                                + int(parts[1]) * 60
+                                + float(parts[2])
+                            )
+                    except ValueError:
+                        continue
+                elif key == "progress" and val == "end":
+                    break
+                else:
+                    continue
+                # throttle callbacks ~1/s
+                if on_progress and (out_time - last_report >= 0.9 or out_time == 0):
+                    on_progress(out_time, duration_hint)
+                    last_report = out_time
+            rc = proc.wait()
+            if rc != 0:
+                err = (proc.stderr.read() if proc.stderr else "") or f"exit {rc}"
+                raise subprocess.CalledProcessError(rc, cmd, stderr=err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    try:
+        _run(with_bsf=True)
+    except subprocess.CalledProcessError:
+        if out_path.exists():
+            out_path.unlink(missing_ok=True)
+        _run(with_bsf=False)
+
+    if on_progress and duration_hint:
+        on_progress(duration_hint, duration_hint)
 
     size = out_path.stat().st_size if out_path.exists() else 0
     if size == 0:

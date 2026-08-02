@@ -1303,10 +1303,10 @@ def search_similar_cmd(
 @click.option(
     "-n",
     "--interval",
-    default=1.0,
+    default=2.0,
     show_default=True,
     type=float,
-    help="更新間隔（秒）",
+    help="更新間隔（秒）。ETA は表示のたびに現在時刻から再計算",
 )
 @click.option(
     "-l",

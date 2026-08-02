@@ -86,7 +86,32 @@ def test_estimate_eta() -> None:
     # 50% after 10s → ~10s remaining (approx)
     from datetime import datetime, timedelta, timezone
 
+    from vdl.queue import Job
+
     started = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
     eta = estimate_eta_sec(started, 50.0)
     assert eta is not None
     assert 5 < eta < 20
+
+    # live recompute in progress_label ignores stale eta_sec
+    j = Job(
+        id=1,
+        kind="download",
+        priority=100,
+        status="running",
+        download_id=None,
+        depends_on_job_id=None,
+        payload_json="{}",
+        result_json=None,
+        error=None,
+        created_at=started,
+        updated_at=started,
+        started_at=started,
+        finished_at=None,
+        progress_pct=50.0,
+        progress_msg="mid",
+        eta_sec=99999.0,  # stale
+    )
+    label = j.progress_label()
+    assert "ETA" in label
+    assert "99999" not in label

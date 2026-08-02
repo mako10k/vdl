@@ -104,11 +104,15 @@ class Job:
             if len(msg) > 28:
                 msg = msg[:25] + "…"
             parts.append(msg)
-        eta = self.eta_sec
-        if eta is None:
+        # Always recompute ETA from "now" for running jobs (stale eta_sec is ignored).
+        if self.status == "running" and pct < 100:
             eta = estimate_eta_sec(self.started_at, pct)
-        if eta is not None and self.status == "running" and pct < 100:
-            parts.append(f"ETA {format_duration(eta)}")
+            if eta is not None:
+                parts.append(f"ETA {format_duration(eta)}")
+            else:
+                elapsed = elapsed_sec(self.started_at)
+                if elapsed is not None and elapsed >= 1:
+                    parts.append(f"run {format_duration(elapsed)}")
         return " ".join(parts)
 
 
@@ -125,23 +129,39 @@ def format_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
+def _parse_iso(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        started = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return started
+    except Exception:
+        return None
+
+
+def elapsed_sec(started_at: str | None) -> float | None:
+    started = _parse_iso(started_at)
+    if not started:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
+
+
 def estimate_eta_sec(started_at: str | None, progress_pct: float) -> float | None:
-    """Linear ETA from elapsed / progress ratio."""
-    if not started_at or progress_pct is None or progress_pct <= 0.5:
+    """
+    Linear ETA from elapsed / progress ratio.
+    Recomputed against wall-clock "now" every time it is called (for live UI).
+    """
+    if progress_pct is None or progress_pct < 1.0:
         return None
     if progress_pct >= 100:
         return 0.0
-    try:
-        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        if elapsed <= 0:
-            return None
-        total = elapsed / (progress_pct / 100.0)
-        return max(0.0, total - elapsed)
-    except Exception:
+    elapsed = elapsed_sec(started_at)
+    if elapsed is None or elapsed <= 0:
         return None
+    total = elapsed / (progress_pct / 100.0)
+    return max(0.0, total - elapsed)
 
 
 class JobQueue:
@@ -590,6 +610,32 @@ class JobQueue:
                 """,
                 (download_id, now, job_id),
             )
+
+    def refresh_running_etas(self) -> int:
+        """
+        Recompute and persist eta_sec for all running jobs (call every few seconds).
+        Returns number of rows updated.
+        """
+        now = _utc_now()
+        n = 0
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, started_at, progress_pct FROM jobs
+                WHERE status = 'running'
+                """
+            ).fetchall()
+            for row in rows:
+                pct = float(row["progress_pct"] or 0.0)
+                eta = estimate_eta_sec(row["started_at"], pct)
+                conn.execute(
+                    """
+                    UPDATE jobs SET eta_sec = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (eta, now, row["id"]),
+                )
+                n += 1
+        return n
 
     def update_progress(
         self,
