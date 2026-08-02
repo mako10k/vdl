@@ -60,10 +60,17 @@ vdl watch --until-idle      # キュー空になったら終了
 vdl registry list      # index 進捗 % も表示
 vdl daemon status
 
-# レジストリ / 検索
+# レジストリ
 vdl registry list
 vdl registry show 1
-vdl registry search '海辺のシーン'
+
+# 検索
+vdl search text '海辺のシーン'          # テキスト↔埋め込み類似
+vdl search similar 2                   # レジストリ id=2 に見た目が似ている動画
+vdl search similar 2 --modality text   # テキスト埋め込みでの類似
+vdl search similar 2 --scene 3         # シーン 3 を基準
+vdl registry search '夕焼け'           # alias
+vdl registry similar 2                 # alias
 ```
 
 デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。  
@@ -120,7 +127,9 @@ vdl daemon run --workers 3 --idle 60
 | `vdl watch` | キュー進捗のライブ表示 |
 | `vdl supervisor start/stop/status/run` | **スーパーバイザ**（ワーカー監視・再起動） |
 | `vdl daemon start/stop/status/run` | ワーカー（**最大3並列**） |
-| `vdl registry list/status/show/search` | レジストリ・ベクトル検索 |
+| `vdl registry list/status/show/search/similar` | レジストリ |
+| `vdl search text "…"` | テキスト類似検索 |
+| `vdl search similar <download_id>` | レジストリ指定の類似検索（既定 CLIP） |
 
 ### 同期デバッグ
 

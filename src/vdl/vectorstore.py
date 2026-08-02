@@ -89,14 +89,22 @@ class VectorStore:
         *,
         n_results: int = 10,
         modality: str = "text",
+        where: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         with _store_lock:
             col = self._collection(modality)
-            res = col.query(
-                query_embeddings=[embedding],
-                n_results=n_results,
-                include=["documents", "metadatas", "distances"],
-            )
+            kwargs: dict[str, Any] = {
+                "query_embeddings": [embedding],
+                "n_results": max(1, n_results),
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where:
+                kwargs["where"] = where
+            try:
+                res = col.query(**kwargs)
+            except Exception:
+                # empty collection or bad where
+                return []
         out: list[dict[str, Any]] = []
         ids = (res.get("ids") or [[]])[0]
         docs = (res.get("documents") or [[]])[0]
@@ -112,3 +120,39 @@ class VectorStore:
                 }
             )
         return out
+
+    def get_embeddings(
+        self,
+        chroma_ids: list[str],
+        *,
+        modality: str = "text",
+    ) -> list[list[float]]:
+        """Fetch stored embedding vectors by chroma ids."""
+        if not chroma_ids:
+            return []
+        with _store_lock:
+            col = self._collection(modality)
+            try:
+                res = col.get(ids=list(chroma_ids), include=["embeddings"])
+            except Exception:
+                return []
+        embs = res.get("embeddings")
+        if embs is None:
+            return []
+        out: list[list[float]] = []
+        for e in embs:
+            if e is None:
+                continue
+            # chroma may return numpy arrays — avoid bool() on arrays
+            try:
+                out.append([float(x) for x in list(e)])
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def count(self, modality: str = "text") -> int:
+        with _store_lock:
+            try:
+                return int(self._collection(modality).count())
+            except Exception:
+                return 0

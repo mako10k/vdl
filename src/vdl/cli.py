@@ -1116,49 +1116,182 @@ def registry_show(ctx: click.Context, download_id: int) -> None:
 @click.argument("query")
 @click.option("-n", "--limit", default=8, show_default=True)
 @click.option(
-    "--modality",
-    type=click.Choice(["text", "clip"], case_sensitive=False),
-    default="text",
-    show_default=True,
+    "--scenes",
+    "by_scene",
+    is_flag=True,
+    help="download 単位に集約せずシーン単位で表示",
 )
 @click.pass_context
 def registry_search(
-    ctx: click.Context, query: str, limit: int, modality: str
+    ctx: click.Context, query: str, limit: int, by_scene: bool
 ) -> None:
-    """テキストクエリでベクトル近傍検索（text=Ollama embed）"""
-    config: Config = ctx.obj["config"]
-    from vdl.index.embed import ollama_embed
-    from vdl.vectorstore import VectorStore
+    """テキスト類似検索（alias: vdl search text）"""
+    ctx.invoke(search_text_cmd, query=query, limit=limit, by_scene=by_scene)
 
-    if modality == "text":
-        emb = ollama_embed(query)
-    else:
-        console.print(
-            "[yellow]clip modality のテキスト検索は未対応（キーフレーム画像が必要）[/yellow]"
-        )
-        sys.exit(2)
 
-    store = VectorStore(config.chroma_dir)
-    hits = store.query(emb, n_results=limit, modality=modality)
+@registry_group.command("similar")
+@click.argument("download_id", type=int)
+@click.option("-n", "--limit", default=8, show_default=True)
+@click.option(
+    "--modality",
+    type=click.Choice(["clip", "text"], case_sensitive=False),
+    default="clip",
+    show_default=True,
+    help="clip=見た目類似 / text=テキスト埋め込み類似",
+)
+@click.option("--scene", "scene_index", type=int, default=None, help="基準シーン index")
+@click.option(
+    "--scenes",
+    "by_scene",
+    is_flag=True,
+    help="download 単位に集約せずシーン単位で表示",
+)
+@click.pass_context
+def registry_similar(
+    ctx: click.Context,
+    download_id: int,
+    limit: int,
+    modality: str,
+    scene_index: int | None,
+    by_scene: bool,
+) -> None:
+    """レジストリ動画との類似検索（alias: vdl search similar）"""
+    ctx.invoke(
+        search_similar_cmd,
+        download_id=download_id,
+        limit=limit,
+        modality=modality,
+        scene_index=scene_index,
+        by_scene=by_scene,
+    )
+
+
+# ---------------------------------------------------------------------------
+# search — text & similar
+# ---------------------------------------------------------------------------
+
+
+def _print_search_hits(hits, *, title: str) -> None:
     if not hits:
         console.print("[dim]ヒットなし[/dim]")
         return
-    table = Table(title=f"search: {query!r}")
+    table = Table(title=title, expand=True)
     table.add_column("#", justify="right")
-    table.add_column("dist")
-    table.add_column("dl")
-    table.add_column("scene")
-    table.add_column("doc")
-    for i, h in enumerate(hits, 1):
-        meta = h.get("metadata") or {}
+    table.add_column("score", justify="right")
+    table.add_column("dl", justify="right")
+    table.add_column("scene", justify="right")
+    table.add_column("time")
+    table.add_column("title / path")
+    table.add_column("doc", overflow="fold")
+    for h in hits:
+        time_s = "-"
+        if h.start_sec is not None and h.end_sec is not None:
+            time_s = f"{h.start_sec:.1f}-{h.end_sec:.1f}s"
+        title_path = h.title or ""
+        if h.path:
+            title_path = (title_path + "\n" if title_path else "") + h.path
         table.add_row(
-            str(i),
-            f"{h.get('distance'):.4f}" if h.get("distance") is not None else "-",
-            str(meta.get("download_id", "-")),
-            str(meta.get("scene_index", "-")),
-            (h.get("document") or "")[:80],
+            str(h.rank),
+            f"{h.score:.3f}",
+            str(h.download_id if h.download_id >= 0 else "-"),
+            str(h.scene_index if h.scene_index is not None else "-"),
+            time_s,
+            title_path or "-",
+            (h.document or "")[:100],
         )
     console.print(table)
+
+
+@main.group("search")
+def search_group() -> None:
+    """動画のテキスト検索 / レジストリ指定の類似検索"""
+
+
+@search_group.command("text")
+@click.argument("query")
+@click.option("-n", "--limit", default=8, show_default=True)
+@click.option(
+    "--scenes",
+    "by_scene",
+    is_flag=True,
+    help="download 単位に集約せずシーン単位で表示",
+)
+@click.pass_context
+def search_text_cmd(
+    ctx: click.Context, query: str, limit: int, by_scene: bool
+) -> None:
+    """テキストクエリとインデックスの類似度で検索（Ollama embed）"""
+    config: Config = ctx.obj["config"]
+    from vdl.search import SearchService
+
+    try:
+        hits = SearchService(config).search_text(
+            query, limit=limit, by_download=not by_scene
+        )
+    except Exception as e:
+        console.print(f"[red]検索失敗[/red] {e}")
+        sys.exit(1)
+    _print_search_hits(
+        hits,
+        title=f"text search: {query!r}" + (" (scenes)" if by_scene else " (by download)"),
+    )
+
+
+@search_group.command("similar")
+@click.argument("download_id", type=int)
+@click.option("-n", "--limit", default=8, show_default=True)
+@click.option(
+    "--modality",
+    type=click.Choice(["clip", "text"], case_sensitive=False),
+    default="clip",
+    show_default=True,
+    help="clip=見た目 / text=テキスト埋め込み",
+)
+@click.option(
+    "--scene",
+    "scene_index",
+    type=int,
+    default=None,
+    help="基準にするシーン index（省略時は全シーン平均）",
+)
+@click.option(
+    "--scenes",
+    "by_scene",
+    is_flag=True,
+    help="download 単位に集約せずシーン単位で表示",
+)
+@click.pass_context
+def search_similar_cmd(
+    ctx: click.Context,
+    download_id: int,
+    limit: int,
+    modality: str,
+    scene_index: int | None,
+    by_scene: bool,
+) -> None:
+    """レジストリの download_id を基準に似ている動画を上位表示"""
+    config: Config = ctx.obj["config"]
+    from vdl.search import SearchService
+
+    try:
+        hits = SearchService(config).search_similar(
+            download_id,
+            scene_index=scene_index,
+            limit=limit,
+            modality=modality,  # type: ignore[arg-type]
+            by_download=not by_scene,
+        )
+    except Exception as e:
+        console.print(f"[red]類似検索失敗[/red] {e}")
+        sys.exit(1)
+    scope = f"dl={download_id}"
+    if scene_index is not None:
+        scope += f" scene={scene_index}"
+    _print_search_hits(
+        hits,
+        title=f"similar to {scope} [{modality}]"
+        + (" (scenes)" if by_scene else " (by download)"),
+    )
 
 
 # ---------------------------------------------------------------------------
