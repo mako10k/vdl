@@ -44,7 +44,10 @@ vdl get 'https://example.com/master.m3u8' -q best
 # キュー監視（progress / ETA 付き）
 vdl queue list
 vdl queue show 1
-vdl registry list   # index 進捗 % も表示
+vdl watch              # ライブ更新（Ctrl+C で終了）
+vdl watch --active -n 0.5
+vdl watch --until-idle # キュー空になったら終了
+vdl registry list      # index 進捗 % も表示
 vdl daemon status
 
 # レジストリ / 検索
@@ -77,7 +80,8 @@ vdl daemon run --workers 3 --idle 60
 | `vdl get URL --no-index` | 索引チェーンを載せない |
 | `vdl queue list/show/cancel/retry` | キュー操作 |
 | `vdl queue reindex <download_id>` | scene→clip→embed 再投入 |
-| `vdl daemon start/stop/status/run` | デーモン |
+| `vdl watch` | キュー進捗のライブ表示 |
+| `vdl daemon start/stop/status/run` | デーモン（**最大3並列**） |
 | `vdl registry list/status/show/search` | レジストリ・ベクトル検索 |
 
 ### 同期デバッグ

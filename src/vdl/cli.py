@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import click
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from vdl import __version__
 from vdl.config import Config
@@ -19,7 +24,7 @@ from vdl.daemon import (
     start_background,
     stop_daemon,
 )
-from vdl.queue import JobQueue
+from vdl.queue import Job, JobQueue
 from vdl.registry import Registry
 from vdl.util import normalize_url
 from vdl.workers import enqueue_download, enqueue_index_chain
@@ -35,6 +40,122 @@ def _parse_header(values: tuple[str, ...]) -> dict[str, str]:
         name, val = v.split(":", 1)
         headers[name.strip()] = val.strip()
     return headers
+
+
+def _status_style(status: str) -> str:
+    return {
+        "pending": "yellow",
+        "running": "cyan",
+        "done": "green",
+        "failed": "red",
+        "cancelled": "dim",
+        "completed": "green",
+    }.get(status, "white")
+
+
+def _jobs_table(
+    rows: list[Job],
+    *,
+    title: str = "jobs",
+    show_updated: bool = True,
+) -> Table:
+    table = Table(title=title, expand=True)
+    table.add_column("ID", justify="right", style="bold")
+    table.add_column("kind")
+    table.add_column("pri", justify="right")
+    table.add_column("status")
+    table.add_column("progress", overflow="fold")
+    table.add_column("dl_id", justify="right")
+    table.add_column("dep", justify="right")
+    if show_updated:
+        table.add_column("updated")
+    for j in rows:
+        style = _status_style(j.status)
+        cells = [
+            str(j.id),
+            j.kind,
+            str(j.priority),
+            f"[{style}]{j.status}[/{style}]",
+            j.progress_label(),
+            str(j.download_id or "-"),
+            str(j.depends_on_job_id or "-"),
+        ]
+        if show_updated:
+            cells.append(j.updated_at[:19] if j.updated_at else "-")
+        table.add_row(*cells)
+    return table
+
+
+def _watch_dashboard(
+    config: Config,
+    *,
+    limit: int = 20,
+    active_only: bool = False,
+) -> Group:
+    """Build a refreshable dashboard for `vdl watch`."""
+    q = JobQueue(config.db_path)
+    st = daemon_status(config)
+    counts = q.counts()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if st["running"]:
+        daemon_line = Text.assemble(
+            ("daemon ", "dim"),
+            ("running", "bold green"),
+            (f" pid={st['pid']}", ""),
+            (f"  workers={st.get('workers', config.daemon_workers)}", "dim"),
+            (f"  idle_sec={st.get('idle_sec', config.daemon_idle_sec)}", "dim"),
+        )
+    else:
+        daemon_line = Text.assemble(
+            ("daemon ", "dim"),
+            ("stopped", "bold yellow"),
+            ("  (will auto-start on get / reindex)", "dim"),
+        )
+
+    counts_parts = []
+    for key in ("running", "pending", "done", "failed", "cancelled"):
+        n = counts.get(key, 0)
+        if n:
+            counts_parts.append(f"[{_status_style(key)}]{key}={n}[/{_status_style(key)}]")
+    counts_line = "  ".join(counts_parts) if counts_parts else "[dim]queue empty[/dim]"
+
+    header = Panel(
+        Group(
+            Text(f"vdl watch  ·  {now}", style="bold"),
+            daemon_line,
+            Text.from_markup(f"queue  {counts_line}"),
+        ),
+        border_style="blue",
+    )
+
+    if active_only:
+        running = q.list_jobs(status="running", limit=limit)
+        pending = q.list_jobs(status="pending", limit=limit)
+        # merge running first, then pending, cap limit
+        rows = (running + pending)[:limit]
+        title = f"active jobs (running+pending, ≤{limit})"
+    else:
+        rows = q.list_jobs(limit=limit)
+        title = f"recent jobs (≤{limit})"
+
+    if rows:
+        body: Table | Text = _jobs_table(rows, title=title)
+    else:
+        body = Text("ジョブなし", style="dim")
+
+    # Highlight in-flight only summary
+    running_jobs = [j for j in rows if j.status == "running"]
+    if running_jobs:
+        run_table = Table(title="in flight", expand=True, show_header=True)
+        run_table.add_column("ID", justify="right")
+        run_table.add_column("kind")
+        run_table.add_column("progress", overflow="fold")
+        for j in running_jobs:
+            run_table.add_row(str(j.id), j.kind, j.progress_label(bar_width=16))
+        return Group(header, run_table, body)
+
+    return Group(header, body)
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -237,34 +358,7 @@ def queue_list(ctx: click.Context, status: Optional[str], kind: Optional[str], l
     if not rows:
         console.print("[dim]ジョブなし[/dim]")
         return
-    table = Table(title="jobs")
-    table.add_column("ID", justify="right")
-    table.add_column("kind")
-    table.add_column("pri", justify="right")
-    table.add_column("status")
-    table.add_column("progress")
-    table.add_column("dl_id", justify="right")
-    table.add_column("dep", justify="right")
-    table.add_column("updated")
-    for j in rows:
-        style = {
-            "pending": "yellow",
-            "running": "cyan",
-            "done": "green",
-            "failed": "red",
-            "cancelled": "dim",
-        }.get(j.status, "white")
-        table.add_row(
-            str(j.id),
-            j.kind,
-            str(j.priority),
-            f"[{style}]{j.status}[/{style}]",
-            j.progress_label(),
-            str(j.download_id or "-"),
-            str(j.depends_on_job_id or "-"),
-            j.updated_at[:19] if j.updated_at else "-",
-        )
-    console.print(table)
+    console.print(_jobs_table(rows))
 
 
 @queue_group.command("show")
@@ -596,6 +690,79 @@ def registry_search(
             (h.get("document") or "")[:80],
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# watch — live queue / progress dashboard
+# ---------------------------------------------------------------------------
+
+
+@main.command("watch")
+@click.option(
+    "-n",
+    "--interval",
+    default=1.0,
+    show_default=True,
+    type=float,
+    help="更新間隔（秒）",
+)
+@click.option(
+    "-l",
+    "--limit",
+    default=20,
+    show_default=True,
+    type=int,
+    help="表示するジョブ件数",
+)
+@click.option(
+    "--active",
+    "active_only",
+    is_flag=True,
+    help="running / pending のみ表示",
+)
+@click.option(
+    "--until-idle",
+    is_flag=True,
+    help="キューが空（pending/running=0）になったら終了",
+)
+@click.pass_context
+def watch_cmd(
+    ctx: click.Context,
+    interval: float,
+    limit: int,
+    active_only: bool,
+    until_idle: bool,
+) -> None:
+    """
+    キューと進捗をライブ表示する（Ctrl+C で終了）。
+
+    例:
+      vdl watch
+      vdl watch --active -n 0.5
+      vdl watch --until-idle
+    """
+    config: Config = ctx.obj["config"]
+    interval = max(0.2, float(interval))
+
+    try:
+        with Live(
+            _watch_dashboard(config, limit=limit, active_only=active_only),
+            console=console,
+            refresh_per_second=max(1, int(1 / interval) if interval < 1 else 2),
+            screen=False,
+        ) as live:
+            while True:
+                time.sleep(interval)
+                live.update(
+                    _watch_dashboard(config, limit=limit, active_only=active_only)
+                )
+                if until_idle:
+                    counts = JobQueue(config.db_path).counts()
+                    if counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
+                        console.print("[green]queue idle — watch done[/green]")
+                        break
+    except KeyboardInterrupt:
+        console.print("\n[dim]watch stopped[/dim]")
 
 
 # ---------------------------------------------------------------------------
