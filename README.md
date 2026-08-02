@@ -37,22 +37,29 @@ ollama pull nomic-embed-text
 ### 典型フロー
 
 ```bash
-# 1. デーモン起動（バックグラウンド）
-vdl daemon start
-vdl daemon status
-
-# 2. URL をキューへ（すぐ戻る）
+# URL をキューへ（すぐ戻る）。デーモン未起動なら自動起動
 vdl get 'https://example.com/video.mp4'
 vdl get 'https://example.com/master.m3u8' -q best
 
-# 3. キュー監視
+# キュー監視
 vdl queue list
-vdl queue show 1
+vdl daemon status
 
-# 4. レジストリ / 検索
+# レジストリ / 検索
 vdl registry list
 vdl registry show 1
 vdl registry search '海辺のシーン'
+```
+
+デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。
+
+```bash
+# アイドル秒数（0=自動終了しない）
+export VDL_DAEMON_IDLE_SEC=120
+
+# 自動起動したくないとき
+vdl get URL --no-daemon
+vdl daemon start   # 手動
 ```
 
 ### CLI マップ

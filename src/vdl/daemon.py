@@ -1,4 +1,4 @@
-"""Background worker: always prefer download jobs over indexing."""
+"""Background worker: download-first queue, auto-start, idle auto-stop."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from vdl.config import Config
+from vdl.config import DAEMON_IDLE_SEC, Config
 from vdl.queue import JobQueue
 from vdl.workers import run_job
 
@@ -75,7 +75,14 @@ def daemon_status(config: Config) -> dict:
         "pid_file": str(config.daemon_pid_path),
         "log_file": str(config.daemon_log_path),
         "queue": q.counts(),
+        "idle_sec": getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC),
     }
+
+
+def _queue_is_idle(queue: JobQueue) -> bool:
+    """True when nothing is pending or running (blocked deps still count as pending)."""
+    counts = queue.counts()
+    return counts.get("pending", 0) == 0 and counts.get("running", 0) == 0
 
 
 def run_forever(
@@ -84,10 +91,21 @@ def run_forever(
     poll_interval: float = 1.0,
     foreground: bool = True,
     write_pid_file: bool = False,
+    idle_sec: float | None = None,
 ) -> None:
+    """
+    Worker loop.
+    If idle_sec > 0 and the queue stays empty (no pending/running) for that long,
+    exit gracefully. Default comes from config / VDL_DAEMON_IDLE_SEC.
+    idle_sec=0 or None with explicit 0 means never auto-stop.
+    """
     config.ensure_dirs()
+    if idle_sec is None:
+        idle_sec = float(getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC))
+    # Background daemons always use idle stop unless explicitly 0.
+    # Foreground without --pid defaults to no idle stop unless --idle is set by CLI.
     logger = _setup_logging(
-        config.daemon_log_path if not foreground or write_pid_file else None,
+        config.daemon_log_path if (not foreground or write_pid_file) else None,
         foreground=foreground,
     )
     state = DaemonState()
@@ -103,34 +121,60 @@ def run_forever(
     if write_pid_file:
         write_pid(config.daemon_pid_path, os.getpid())
 
-    logger.info("daemon started home=%s", config.home)
+    logger.info(
+        "daemon started home=%s idle_sec=%s",
+        config.home,
+        idle_sec if idle_sec and idle_sec > 0 else "disabled",
+    )
+    idle_since: float | None = None
     try:
         while not state.stopping:
             job = queue.claim_next()
-            if not job:
-                time.sleep(poll_interval)
+            if job:
+                idle_since = None
+                logger.info(
+                    "job start id=%s kind=%s priority=%s download_id=%s",
+                    job.id,
+                    job.kind,
+                    job.priority,
+                    job.download_id,
+                )
+                try:
+                    result = run_job(config, job)
+                    queue.mark_done(job.id, result)
+                    logger.info("job done id=%s kind=%s", job.id, job.kind)
+                except Exception as e:
+                    queue.mark_failed(job.id, str(e))
+                    logger.exception("job failed id=%s: %s", job.id, e)
                 continue
-            logger.info(
-                "job start id=%s kind=%s priority=%s download_id=%s",
-                job.id,
-                job.kind,
-                job.priority,
-                job.download_id,
-            )
-            try:
-                result = run_job(config, job)
-                queue.mark_done(job.id, result)
-                logger.info("job done id=%s kind=%s", job.id, job.kind)
-            except Exception as e:
-                queue.mark_failed(job.id, str(e))
-                logger.exception("job failed id=%s: %s", job.id, e)
+
+            # No claimable job right now
+            now = time.time()
+            if idle_sec and idle_sec > 0 and _queue_is_idle(queue):
+                if idle_since is None:
+                    idle_since = now
+                    logger.info("queue empty; idle timer started (%.0fs)", idle_sec)
+                elif (now - idle_since) >= idle_sec:
+                    logger.info(
+                        "idle timeout reached (%.0fs); shutting down", idle_sec
+                    )
+                    break
+            else:
+                # Work still pending (e.g. waiting on dependency) — don't idle-exit
+                idle_since = None
+
+            time.sleep(poll_interval)
     finally:
         if write_pid_file:
             remove_pid(config.daemon_pid_path)
         logger.info("daemon stopped")
 
 
-def start_background(config: Config) -> int:
+def start_background(
+    config: Config,
+    *,
+    idle_sec: float | None = None,
+) -> int:
     """Spawn `vdl daemon run --pid` in background; return child pid."""
     import subprocess
 
@@ -139,7 +183,9 @@ def start_background(config: Config) -> int:
         raise RuntimeError(f"daemon already running pid={st['pid']}")
 
     config.ensure_dirs()
-    # Use same interpreter module entry
+    if idle_sec is None:
+        idle_sec = float(getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC))
+
     cmd = [
         sys.executable,
         "-m",
@@ -149,8 +195,9 @@ def start_background(config: Config) -> int:
         "daemon",
         "run",
         "--pid",
+        "--idle",
+        str(idle_sec),
     ]
-    # detach
     logf = open(config.daemon_log_path, "a", encoding="utf-8")
     proc = subprocess.Popen(
         cmd,
@@ -160,13 +207,38 @@ def start_background(config: Config) -> int:
         start_new_session=True,
         close_fds=True,
     )
-    # wait briefly for pid file
     for _ in range(50):
         time.sleep(0.1)
         pid = read_pid(config.daemon_pid_path)
         if pid and pid_is_running(pid):
             return pid
     return proc.pid
+
+
+def ensure_daemon_running(
+    config: Config,
+    *,
+    idle_sec: float | None = None,
+) -> tuple[int, bool]:
+    """
+    Ensure a background daemon is running.
+    Returns (pid, started_now).
+    """
+    st = daemon_status(config)
+    if st["running"] and st["pid"] is not None:
+        return int(st["pid"]), False
+    # Stale pid file
+    if st["pid"] and not st["running"]:
+        remove_pid(config.daemon_pid_path)
+    try:
+        pid = start_background(config, idle_sec=idle_sec)
+        return pid, True
+    except RuntimeError:
+        # Race: another process started it
+        st2 = daemon_status(config)
+        if st2["running"] and st2["pid"] is not None:
+            return int(st2["pid"]), False
+        raise
 
 
 def stop_daemon(config: Config, *, timeout: float = 30.0) -> bool:

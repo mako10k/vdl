@@ -29,6 +29,8 @@ CLIP_PRETRAINED = os.environ.get("VDL_CLIP_PRETRAINED", "openai")
 OLLAMA_BASE = os.environ.get("VDL_OLLAMA_BASE", "http://127.0.0.1:11434")
 OLLAMA_EMBED_MODEL = os.environ.get("VDL_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 FRAMES_PER_SCENE = int(os.environ.get("VDL_FRAMES_PER_SCENE", "5"))
+# Background daemon exits after this many idle seconds with empty queue (0 = never).
+DAEMON_IDLE_SEC = float(os.environ.get("VDL_DAEMON_IDLE_SEC", "60"))
 
 
 class Config:
@@ -41,6 +43,7 @@ class Config:
         self.keyframes_dir = self.home / KEYFRAMES_DIR_NAME
         self.daemon_pid_path = self.home / DAEMON_PID_NAME
         self.daemon_log_path = self.home / DAEMON_LOG_NAME
+        self.daemon_idle_sec = DAEMON_IDLE_SEC
 
     def ensure_dirs(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)

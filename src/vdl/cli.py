@@ -12,7 +12,13 @@ from rich.table import Table
 
 from vdl import __version__
 from vdl.config import Config
-from vdl.daemon import daemon_status, run_forever, start_background, stop_daemon
+from vdl.daemon import (
+    daemon_status,
+    ensure_daemon_running,
+    run_forever,
+    start_background,
+    stop_daemon,
+)
 from vdl.queue import JobQueue
 from vdl.registry import Registry
 from vdl.util import normalize_url
@@ -100,6 +106,11 @@ def main(ctx: click.Context, home_dir: Optional[Path]) -> None:
     is_flag=True,
     help="DL 後の索引パイプラインをエンキューしない",
 )
+@click.option(
+    "--no-daemon",
+    is_flag=True,
+    help="ジョブ投入後にデーモンを自動起動しない",
+)
 @click.pass_context
 def get_cmd(
     ctx: click.Context,
@@ -112,8 +123,9 @@ def get_cmd(
     timeout: float,
     sync: bool,
     no_index: bool,
+    no_daemon: bool,
 ) -> None:
-    """URL をダウンロードキューに投入（既定）。--sync で同期実行。"""
+    """URL をダウンロードキューに投入（既定）。必要ならデーモンを自動起動。"""
     config: Config = ctx.obj["config"]
     headers = _parse_header(header)
 
@@ -140,6 +152,8 @@ def get_cmd(
                     console.print(
                         f"[dim]index chain enqueued for download_id={r.record_id}[/dim]"
                     )
+            if not no_daemon:
+                _auto_start_daemon(config)
         failed = [r for r in results if r.status == "failed"]
         if failed:
             sys.exit(1)
@@ -157,16 +171,33 @@ def get_cmd(
         timeout=timeout,
         no_index=no_index,
     )
-    st = daemon_status(config)
     console.print(f"[green]queued[/green] job_id={job.id} kind=download priority={job.priority}")
     console.print(f"  url: {url}")
-    if st["running"]:
-        console.print(f"[dim]daemon running pid={st['pid']}[/dim]")
+    if no_daemon:
+        st = daemon_status(config)
+        if st["running"]:
+            console.print(f"[dim]daemon running pid={st['pid']}[/dim]")
+        else:
+            console.print("[yellow]daemon 未起動[/yellow] (--no-daemon)")
     else:
+        _auto_start_daemon(config)
+
+
+def _auto_start_daemon(config: Config) -> None:
+    try:
+        pid, started = ensure_daemon_running(config)
+    except Exception as e:
+        console.print(f"[red]daemon 自動起動失敗[/red] {e}")
+        console.print("[dim]`vdl daemon start` を手動で実行してください[/dim]")
+        return
+    idle = getattr(config, "daemon_idle_sec", 60)
+    if started:
         console.print(
-            "[yellow]daemon 未起動[/yellow] — "
-            "`vdl daemon start` で処理開始、または `vdl get --sync ...`"
+            f"[cyan]daemon auto-started[/cyan] pid={pid} "
+            f"(idle exit after {idle:g}s empty queue)"
         )
+    else:
+        console.print(f"[dim]daemon running pid={pid}[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +311,9 @@ def queue_retry(ctx: click.Context, job_id: int) -> None:
 
 @queue_group.command("reindex")
 @click.argument("download_id", type=int)
+@click.option("--no-daemon", is_flag=True, help="デーモン自動起動しない")
 @click.pass_context
-def queue_reindex(ctx: click.Context, download_id: int) -> None:
+def queue_reindex(ctx: click.Context, download_id: int, no_daemon: bool) -> None:
     """完了済み download に対し scene→clip→embed を再投入"""
     config: Config = ctx.obj["config"]
     reg = Registry(config.db_path)
@@ -294,6 +326,8 @@ def queue_reindex(ctx: click.Context, download_id: int) -> None:
     console.print(
         f"[green]reindex queued[/green] scene={s.id} clip={c.id} embed={e.id} download_id={download_id}"
     )
+    if not no_daemon:
+        _auto_start_daemon(config)
 
 
 # ---------------------------------------------------------------------------
@@ -309,15 +343,32 @@ def daemon_group() -> None:
 @daemon_group.command("run")
 @click.option("--interval", default=1.0, show_default=True, type=float)
 @click.option("--pid", "write_pid", is_flag=True, help="PID ファイルを書く")
+@click.option(
+    "--idle",
+    "idle_sec",
+    type=float,
+    default=None,
+    help="キュー空のままこの秒数で自動終了 (0=無効)。未指定時: --pid なら設定値、否則は無効",
+)
 @click.pass_context
-def daemon_run(ctx: click.Context, interval: float, write_pid: bool) -> None:
+def daemon_run(
+    ctx: click.Context, interval: float, write_pid: bool, idle_sec: float | None
+) -> None:
     """フォアグラウンドでワーカーループを実行"""
     config: Config = ctx.obj["config"]
+    # Background (--pid): default idle from config. Foreground: no idle unless --idle given.
+    if idle_sec is None:
+        effective_idle = (
+            float(config.daemon_idle_sec) if write_pid else 0.0
+        )
+    else:
+        effective_idle = float(idle_sec)
     run_forever(
         config,
         poll_interval=interval,
         foreground=True,
         write_pid_file=write_pid,
+        idle_sec=effective_idle,
     )
 
 
@@ -357,6 +408,7 @@ def daemon_status_cmd(ctx: click.Context) -> None:
         console.print("[yellow]stopped[/yellow]")
     console.print(f"  pid_file: {st['pid_file']}")
     console.print(f"  log_file: {st['log_file']}")
+    console.print(f"  idle_sec: {st.get('idle_sec', config.daemon_idle_sec)} (empty-queue auto-stop)")
     console.print(f"  queue:    {st['queue']}")
 
 
@@ -531,6 +583,7 @@ def info_cmd(ctx: click.Context) -> None:
     console.print(f"keyframes:  {config.keyframes_dir}")
     console.print(f"temp:       {config.temp_dir}")
     console.print(f"daemon:     {'running pid='+str(st['pid']) if st['running'] else 'stopped'}")
+    console.print(f"idle_sec:   {config.daemon_idle_sec} (VDL_DAEMON_IDLE_SEC)")
     console.print(f"queue:      {st['queue']}")
 
 
