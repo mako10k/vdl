@@ -26,6 +26,14 @@ from vdl.daemon import (
 )
 from vdl.queue import Job, JobQueue
 from vdl.registry import Registry
+from vdl.supervisor import (
+    ensure_runtime,
+    ensure_supervisor_running,
+    run_forever as supervisor_run_forever,
+    start_background as supervisor_start_background,
+    stop_supervisor,
+    supervisor_status,
+)
 from vdl.util import normalize_url
 from vdl.workers import enqueue_download, enqueue_index_chain
 
@@ -98,9 +106,21 @@ def _watch_dashboard(
     counts = q.counts()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    sup = supervisor_status(config)
+    if sup["running"]:
+        sup_line = Text.assemble(
+            ("supervisor ", "dim"),
+            ("running", "bold green"),
+            (f" pid={sup['pid']}", ""),
+        )
+    else:
+        sup_line = Text.assemble(
+            ("supervisor ", "dim"),
+            ("stopped", "yellow"),
+        )
     if st["running"]:
         daemon_line = Text.assemble(
-            ("daemon ", "dim"),
+            ("worker    ", "dim"),
             ("running", "bold green"),
             (f" pid={st['pid']}", ""),
             (f"  workers={st.get('workers', config.daemon_workers)}", "dim"),
@@ -108,9 +128,9 @@ def _watch_dashboard(
         )
     else:
         daemon_line = Text.assemble(
-            ("daemon ", "dim"),
+            ("worker    ", "dim"),
             ("stopped", "bold yellow"),
-            ("  (will auto-start on get / reindex)", "dim"),
+            ("  (supervisor restarts when queue has work)", "dim"),
         )
     if st.get("reload_job_id"):
         reload_line = Text.assemble(
@@ -135,6 +155,7 @@ def _watch_dashboard(
     header = Panel(
         Group(
             Text(f"vdl watch  ·  {now}", style="bold"),
+            sup_line,
             daemon_line,
             reload_line,
             Text.from_markup(f"queue  {counts_line}"),
@@ -318,21 +339,40 @@ def get_cmd(
 
 
 def _auto_start_daemon(config: Config) -> None:
+    """Start supervisor (preferred) or worker; supervisor keeps worker alive."""
     try:
-        pid, started = ensure_daemon_running(config)
+        role, pid, started = ensure_runtime(config)
     except Exception as e:
-        console.print(f"[red]daemon 自動起動失敗[/red] {e}")
-        console.print("[dim]`vdl daemon start` を手動で実行してください[/dim]")
-        return
-    idle = getattr(config, "daemon_idle_sec", 60)
-    workers = getattr(config, "daemon_workers", 3)
-    if started:
+        console.print(f"[red]runtime 自動起動失敗[/red] {e}")
         console.print(
-            f"[cyan]daemon auto-started[/cyan] pid={pid} "
-            f"workers={workers} (idle exit after {idle:g}s empty queue)"
+            "[dim]`vdl supervisor start` または `vdl daemon start` を実行してください[/dim]"
         )
+        return
+    if role == "supervisor":
+        idle = getattr(config, "supervisor_idle_sec", 120)
+        if started:
+            console.print(
+                f"[cyan]supervisor auto-started[/cyan] pid={pid} "
+                f"(keeps worker alive; idle exit after {idle:g}s)"
+            )
+        else:
+            console.print(f"[dim]supervisor running pid={pid}[/dim]")
+        # Show worker status too
+        wst = daemon_status(config)
+        if wst["running"]:
+            console.print(f"[dim]worker running pid={wst['pid']}[/dim]")
+        else:
+            console.print("[dim]worker will start when supervisor sees queue work[/dim]")
     else:
-        console.print(f"[dim]daemon running pid={pid}[/dim]")
+        idle = getattr(config, "daemon_idle_sec", 60)
+        workers = getattr(config, "daemon_workers", 3)
+        if started:
+            console.print(
+                f"[cyan]daemon auto-started[/cyan] pid={pid} "
+                f"workers={workers} (idle exit after {idle:g}s empty queue)"
+            )
+        else:
+            console.print(f"[dim]daemon running pid={pid}[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +593,100 @@ def daemon_status_cmd(ctx: click.Context) -> None:
     console.print(f"  idle_sec: {st.get('idle_sec', config.daemon_idle_sec)} (empty-queue auto-stop)")
     console.print(f"  workers:  {st.get('workers', config.daemon_workers)} (max parallel jobs)")
     console.print(f"  queue:    {st['queue']}")
+
+
+# ---------------------------------------------------------------------------
+# supervisor — keeps worker daemon alive
+# ---------------------------------------------------------------------------
+
+
+@main.group("supervisor")
+def supervisor_group() -> None:
+    """ワーカーデーモンの監視・自動再起動（ジョブが残っている間）"""
+
+
+@supervisor_group.command("run")
+@click.option("--interval", default=1.0, show_default=True, type=float)
+@click.option("--pid", "write_pid", is_flag=True, help="PID ファイルを書く")
+@click.option(
+    "--idle",
+    "idle_sec",
+    type=float,
+    default=None,
+    help="キュー空+worker停止のままこの秒数で終了 (0=無効)",
+)
+@click.pass_context
+def supervisor_run(
+    ctx: click.Context,
+    interval: float,
+    write_pid: bool,
+    idle_sec: float | None,
+) -> None:
+    """フォアグラウンドでスーパーバイザを実行"""
+    config: Config = ctx.obj["config"]
+    if idle_sec is None:
+        effective = float(config.supervisor_idle_sec) if write_pid else 0.0
+    else:
+        effective = float(idle_sec)
+    supervisor_run_forever(
+        config,
+        poll_interval=interval,
+        foreground=True,
+        write_pid_file=write_pid,
+        idle_sec=effective,
+    )
+
+
+@supervisor_group.command("start")
+@click.pass_context
+def supervisor_start(ctx: click.Context) -> None:
+    """バックグラウンドでスーパーバイザ起動"""
+    config: Config = ctx.obj["config"]
+    try:
+        pid = supervisor_start_background(config)
+    except RuntimeError as e:
+        console.print(f"[yellow]{e}[/yellow]")
+        sys.exit(1)
+    console.print(f"[green]supervisor started[/green] pid={pid}")
+    console.print(f"  log: {config.supervisor_log_path}")
+
+
+@supervisor_group.command("stop")
+@click.option(
+    "--with-worker",
+    is_flag=True,
+    help="ワーカーデーモンも停止する",
+)
+@click.pass_context
+def supervisor_stop(ctx: click.Context, with_worker: bool) -> None:
+    config: Config = ctx.obj["config"]
+    ok = stop_supervisor(config, stop_worker=with_worker)
+    if ok:
+        console.print("[green]supervisor stopped[/green]")
+    else:
+        console.print("[dim]supervisor was not running[/dim]")
+    if with_worker:
+        console.print("[dim]worker stop requested[/dim]")
+
+
+@supervisor_group.command("status")
+@click.pass_context
+def supervisor_status_cmd(ctx: click.Context) -> None:
+    config: Config = ctx.obj["config"]
+    st = supervisor_status(config)
+    if st["running"]:
+        console.print(f"[green]running[/green] pid={st['pid']}")
+    else:
+        console.print("[yellow]stopped[/yellow]")
+    console.print(f"  pid_file: {st['pid_file']}")
+    console.print(f"  log_file: {st['log_file']}")
+    console.print(f"  idle_sec: {st.get('idle_sec')}")
+    w = st.get("worker") or {}
+    if w.get("running"):
+        console.print(f"  worker:   running pid={w.get('pid')}")
+    else:
+        console.print("  worker:   stopped")
+    console.print(f"  queue:    {st.get('queue')}")
 
 
 # ---------------------------------------------------------------------------
@@ -819,8 +953,13 @@ def info_cmd(ctx: click.Context) -> None:
     console.print(f"chroma:     {config.chroma_dir}")
     console.print(f"keyframes:  {config.keyframes_dir}")
     console.print(f"temp:       {config.temp_dir}")
-    console.print(f"daemon:     {'running pid='+str(st['pid']) if st['running'] else 'stopped'}")
-    console.print(f"idle_sec:   {config.daemon_idle_sec} (VDL_DAEMON_IDLE_SEC)")
+    sup = supervisor_status(config)
+    console.print(
+        f"supervisor: {'running pid='+str(sup['pid']) if sup['running'] else 'stopped'}"
+        f" (VDL_SUPERVISOR={'on' if config.supervisor_enabled else 'off'})"
+    )
+    console.print(f"worker:     {'running pid='+str(st['pid']) if st['running'] else 'stopped'}")
+    console.print(f"idle_sec:   worker={config.daemon_idle_sec} supervisor={config.supervisor_idle_sec}")
     console.print(f"workers:    {config.daemon_workers} (VDL_DAEMON_WORKERS)")
     console.print(f"auto_reload:{'on' if config.daemon_auto_reload else 'off'} (VDL_DAEMON_AUTO_RELOAD)")
     if st.get("reload_job_id"):

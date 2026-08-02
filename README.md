@@ -59,6 +59,22 @@ vdl registry search '海辺のシーン'
 デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。  
 実行可能なジョブは **最大 3 並列**（`VDL_DAEMON_WORKERS`）で処理します。優先度の高い download から claim されます。
 
+### スーパーバイザ
+
+`vdl get` は既定で **supervisor** を自動起動します（`VDL_SUPERVISOR=0` でワーカー直起動）。
+
+| 役割 | プロセス |
+|------|----------|
+| supervisor | キューに仕事があれば worker を起動・クラッシュ時に再起動。空きが続けばアイドル終了 |
+| worker (`daemon`) | 実際のジョブ実行（並列 / reload） |
+
+```bash
+vdl supervisor status
+vdl supervisor start
+vdl supervisor stop --with-worker
+export VDL_SUPERVISOR_IDLE_SEC=120
+```
+
 ### 自己更新（`daemon_reload`）
 
 ジョブの切れ目（in-flight が 0 のとき）にパッケージコードの変更を検知すると、  
@@ -90,7 +106,8 @@ vdl daemon run --workers 3 --idle 60
 | `vdl queue list/show/cancel/retry` | キュー操作 |
 | `vdl queue reindex <download_id>` | scene→clip→embed 再投入 |
 | `vdl watch` | キュー進捗のライブ表示 |
-| `vdl daemon start/stop/status/run` | デーモン（**最大3並列**） |
+| `vdl supervisor start/stop/status/run` | **スーパーバイザ**（ワーカー監視・再起動） |
+| `vdl daemon start/stop/status/run` | ワーカー（**最大3並列**） |
 | `vdl registry list/status/show/search` | レジストリ・ベクトル検索 |
 
 ### 同期デバッグ

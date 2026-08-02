@@ -15,6 +15,8 @@ CHROMA_DIR_NAME = "chroma"
 KEYFRAMES_DIR_NAME = "keyframes"
 DAEMON_PID_NAME = "daemon.pid"
 DAEMON_LOG_NAME = "daemon.log"
+SUPERVISOR_PID_NAME = "supervisor.pid"
+SUPERVISOR_LOG_NAME = "supervisor.log"
 
 # Job priorities (higher first)
 PRIORITY_DOWNLOAD = 100
@@ -42,6 +44,15 @@ DAEMON_AUTO_RELOAD = os.environ.get("VDL_DAEMON_AUTO_RELOAD", "1").strip() not i
     "no",
     "off",
 }
+# Supervisor exits after this many seconds with empty queue + no worker (0 = never).
+SUPERVISOR_IDLE_SEC = float(os.environ.get("VDL_SUPERVISOR_IDLE_SEC", "120"))
+# Use supervisor to keep the worker alive (default on).
+SUPERVISOR_ENABLED = os.environ.get("VDL_SUPERVISOR", "1").strip() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 class Config:
@@ -54,9 +65,13 @@ class Config:
         self.keyframes_dir = self.home / KEYFRAMES_DIR_NAME
         self.daemon_pid_path = self.home / DAEMON_PID_NAME
         self.daemon_log_path = self.home / DAEMON_LOG_NAME
+        self.supervisor_pid_path = self.home / SUPERVISOR_PID_NAME
+        self.supervisor_log_path = self.home / SUPERVISOR_LOG_NAME
         self.daemon_idle_sec = DAEMON_IDLE_SEC
         self.daemon_workers = max(1, DAEMON_WORKERS)
         self.daemon_auto_reload = DAEMON_AUTO_RELOAD
+        self.supervisor_idle_sec = SUPERVISOR_IDLE_SEC
+        self.supervisor_enabled = SUPERVISOR_ENABLED
 
     def ensure_dirs(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)

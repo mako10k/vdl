@@ -13,6 +13,8 @@ keyframes/
 chroma/
 daemon.log
 daemon.pid
+supervisor.log
+supervisor.pid
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
