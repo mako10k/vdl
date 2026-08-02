@@ -253,13 +253,20 @@ def main(ctx: click.Context, home_dir: Optional[Path]) -> None:
     "--yes",
     "auto_yes",
     is_flag=True,
-    help="HTML 候補は新規のみ（同期時・ジョブ内）",
+    help="HTML 候補の選択をスキップし新規のみ対象（--enqueue と併用）",
 )
 @click.option(
     "--all",
     "select_all",
     is_flag=True,
-    help="HTML 候補をすべて対象",
+    help="HTML 候補をすべて対象（--enqueue と併用）",
+)
+@click.option(
+    "--enqueue",
+    "-e",
+    "do_enqueue",
+    is_flag=True,
+    help="HTML 候補をダウンロードジョブとしてキュー投入（オプトイン）",
 )
 @click.option(
     "--timeout",
@@ -271,7 +278,7 @@ def main(ctx: click.Context, home_dir: Optional[Path]) -> None:
 @click.option(
     "--sync",
     is_flag=True,
-    help="キューを使わず同期実行（デバッグ用）",
+    help="キューを使わず同期実行（動画直リンク / 明示的DL用）",
 )
 @click.option(
     "--no-index",
@@ -292,18 +299,59 @@ def get_cmd(
     header: tuple[str, ...],
     auto_yes: bool,
     select_all: bool,
+    do_enqueue: bool,
     timeout: float,
     sync: bool,
     no_index: bool,
     no_daemon: bool,
 ) -> None:
-    """URL をダウンロードキューに投入（既定）。必要ならデーモンを自動起動。"""
+    """
+    URL を処理する。
+
+    - 動画 / m3u8: 既定でダウンロードジョブをキュー投入
+    - HTML ページ: 既定で候補一覧のみ（--enqueue でジョブ投入をオプトイン）
+    """
     config: Config = ctx.obj["config"]
     headers = _parse_header(header)
 
-    if sync:
-        from vdl.service import DownloadService
+    from vdl.classifier import ResourceKind, ResourceProbe
+    from vdl.service import DownloadService
+    import httpx
 
+    # Probe to branch HTML vs media
+    kind = None
+    try:
+        with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+            probe = ResourceProbe(client, timeout=timeout)
+            classified = probe.probe(url, extra_headers=headers or None)
+            kind = classified.kind
+            console.print(
+                f"[dim]分類:[/dim] {kind.value}  "
+                f"[dim]→[/dim] {classified.final_url}"
+            )
+    except Exception as e:
+        console.print(f"[yellow]分類プローブ失敗[/yellow] {e} — ダウンロードジョブとして投入します")
+
+    # HTML / unknown → candidates list (enqueue is opt-in)
+    if kind in (ResourceKind.HTML, ResourceKind.UNKNOWN):
+        _run_html_get(
+            config,
+            url,
+            headers=headers,
+            quality=quality,
+            force=force,
+            timeout=timeout,
+            auto_yes=auto_yes,
+            select_all=select_all,
+            do_enqueue=do_enqueue,
+            no_index=no_index,
+            no_daemon=no_daemon,
+            sync=sync,
+        )
+        return
+
+    # Direct media: video or index (or probe failed → treat as download job)
+    if sync:
         with DownloadService(
             config,
             quality=quality,
@@ -313,8 +361,9 @@ def get_cmd(
         ) as svc:
             results = svc.process_url(
                 url,
-                select_all=select_all,
-                auto_yes=auto_yes or select_all,
+                select_all=False,
+                auto_yes=False,
+                list_only=False,
             )
         if not no_index:
             q = JobQueue(config.db_path)
@@ -338,8 +387,8 @@ def get_cmd(
         quality=quality,
         force=force,
         headers=headers,
-        auto_yes=auto_yes or True,  # non-interactive in worker
-        select_all=select_all,
+        auto_yes=False,
+        select_all=False,
         timeout=timeout,
         no_index=no_index,
     )
@@ -353,6 +402,184 @@ def get_cmd(
             console.print("[yellow]daemon 未起動[/yellow] (--no-daemon)")
     else:
         _auto_start_daemon(config)
+
+
+def _run_html_get(
+    config: Config,
+    url: str,
+    *,
+    headers: dict[str, str],
+    quality: str,
+    force: bool,
+    timeout: float,
+    auto_yes: bool,
+    select_all: bool,
+    do_enqueue: bool,
+    no_index: bool,
+    no_daemon: bool,
+    sync: bool,
+) -> None:
+    """List HTML media candidates; optionally enqueue/sync-download them."""
+    from vdl.service import DownloadService
+
+    with DownloadService(
+        config,
+        quality=quality,
+        force=force,
+        headers=headers,
+        timeout=timeout,
+    ) as svc:
+        try:
+            page_url, rows = svc.fetch_html_candidates(url)
+        except Exception as e:
+            console.print(f"[red]ページ取得失敗[/red] {e}")
+            sys.exit(1)
+
+        if not rows:
+            console.print("[yellow]動画・インデックス候補が見つかりませんでした。[/yellow]")
+            return
+
+        svc.print_candidates_table(page_url, rows)
+
+        if not do_enqueue and not sync:
+            console.print(
+                f"[dim]候補 {len(rows)} 件を表示しました。"
+                " ジョブ投入は --enqueue（-e）を付けて再実行してください。[/dim]"
+            )
+            return
+
+        # Enqueue or sync-download selected candidates
+        indices = svc.select_candidate_indices(
+            rows,
+            select_all=select_all,
+            auto_yes=auto_yes or select_all,
+            interactive=not (auto_yes or select_all),
+        )
+        if indices is None:
+            console.print("[dim]キャンセル[/dim]")
+            return
+        if not indices:
+            console.print("[dim]対象候補がありません[/dim]")
+            return
+
+        if sync:
+            for i in indices:
+                c, existing = rows[i]
+                if existing and not force:
+                    console.print(
+                        f"[yellow]#{i+1} スキップ[/yellow] 済 id={existing.id}"
+                    )
+                    continue
+                console.print(f"[bold]#{i+1} sync DL[/bold] {c.url}")
+                results = svc.process_url(
+                    c.url,
+                    parent_page_url=page_url,
+                    list_only=False,
+                )
+                if not no_index:
+                    q = JobQueue(config.db_path)
+                    for r in results:
+                        if r.record_id and r.status in ("downloaded", "skipped"):
+                            enqueue_index_chain(q, r.record_id)
+            if not no_daemon and not no_index:
+                _auto_start_daemon(config)
+            return
+
+        q = JobQueue(config.db_path)
+        job_ids: list[int] = []
+        for i in indices:
+            c, existing = rows[i]
+            if existing and not force:
+                console.print(
+                    f"[yellow]#{i+1} スキップ[/yellow] 済 id={existing.id} {c.url}"
+                )
+                continue
+            job = enqueue_download(
+                q,
+                c.url,
+                quality=quality,
+                force=force,
+                headers=headers,
+                timeout=timeout,
+                no_index=no_index,
+            )
+            job_ids.append(job.id)
+            console.print(
+                f"[green]queued[/green] #{i+1} job_id={job.id} [{c.kind}] {c.url}"
+            )
+
+        if not job_ids:
+            console.print("[dim]新規ジョブはありませんでした[/dim]")
+            return
+        console.print(f"[dim]enqueued {len(job_ids)} download job(s) from page[/dim]")
+        if not no_daemon:
+            _auto_start_daemon(config)
+
+
+@main.command("candidates")
+@click.argument("url")
+@click.option(
+    "-H",
+    "--header",
+    multiple=True,
+    help="追加 HTTP ヘッダ",
+)
+@click.option(
+    "--enqueue",
+    "-e",
+    "do_enqueue",
+    is_flag=True,
+    help="選択した候補をダウンロードジョブとして投入（オプトイン）",
+)
+@click.option(
+    "-y",
+    "--yes",
+    "auto_yes",
+    is_flag=True,
+    help="新規候補をすべて対象（--enqueue 時）",
+)
+@click.option(
+    "--all",
+    "select_all",
+    is_flag=True,
+    help="全候補を対象（--enqueue 時）",
+)
+@click.option("-f", "--force", is_flag=True, help="済でも再取得ジョブを投入")
+@click.option("-q", "--quality", default="best", show_default=True)
+@click.option("--timeout", default=60.0, show_default=True, type=float)
+@click.option("--no-index", is_flag=True)
+@click.option("--no-daemon", is_flag=True)
+@click.pass_context
+def candidates_cmd(
+    ctx: click.Context,
+    url: str,
+    header: tuple[str, ...],
+    do_enqueue: bool,
+    auto_yes: bool,
+    select_all: bool,
+    force: bool,
+    quality: str,
+    timeout: float,
+    no_index: bool,
+    no_daemon: bool,
+) -> None:
+    """HTML ページから動画 / m3u8 候補を抽出して表示する。"""
+    config: Config = ctx.obj["config"]
+    headers = _parse_header(header)
+    _run_html_get(
+        config,
+        url,
+        headers=headers,
+        quality=quality,
+        force=force,
+        timeout=timeout,
+        auto_yes=auto_yes,
+        select_all=select_all,
+        do_enqueue=do_enqueue,
+        no_index=no_index,
+        no_daemon=no_daemon,
+        sync=False,
+    )
 
 
 def _auto_start_daemon(config: Config) -> None:

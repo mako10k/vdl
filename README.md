@@ -37,9 +37,17 @@ ollama pull nomic-embed-text
 ### 典型フロー
 
 ```bash
-# URL をキューへ（すぐ戻る）。デーモン未起動なら自動起動
+# 動画 / m3u8 → ダウンロードジョブ投入（すぐ戻る）
 vdl get 'https://example.com/video.mp4'
 vdl get 'https://example.com/master.m3u8' -q best
+
+# HTML ページ → 既定は候補一覧のみ（ジョブは作らない）
+vdl get 'https://example.com/watch/123'
+vdl candidates 'https://example.com/watch/123'
+
+# 候補をキュー投入（オプトイン）
+vdl get 'https://example.com/watch/123' --enqueue -y    # 新規すべて
+vdl candidates 'https://...' -e                         # 対話で番号選択して投入
 
 # キュー監視（progress / ETA 付き）
 vdl queue list              # 古い done は既定で非表示（直近10分＋種別最終のみ）
@@ -102,7 +110,9 @@ vdl daemon run --workers 3 --idle 60
 
 | コマンド | 役割 |
 |----------|------|
-| `vdl get URL` | **download ジョブをキュー投入**（既定） |
+| `vdl get URL` | 動画/m3u8 → DL ジョブ投入。HTML → **候補一覧のみ** |
+| `vdl get URL --enqueue` / `-e` | HTML 候補を DL ジョブ投入（オプトイン） |
+| `vdl candidates URL` | HTML スクレイプ専用（同上） |
 | `vdl get URL --sync` | 同期 DL（デバッグ用） |
 | `vdl get URL --no-index` | 索引チェーンを載せない |
 | `vdl queue list/show/cancel/retry` | キュー操作 |

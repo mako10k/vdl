@@ -181,11 +181,13 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
         results = svc.process_url(
             url,
             select_all=bool(p.get("select_all")),
-            auto_yes=bool(p.get("auto_yes", True)),
+            auto_yes=bool(p.get("auto_yes", False)),
+            list_only=bool(p.get("list_only", False)),
         )
 
     downloaded_ids: list[int] = []
     artifact_paths: list[str] = []
+    listed = [r for r in results if r.status == "listed"]
     for r in results:
         if r.record_id and r.status in ("downloaded", "skipped"):
             downloaded_ids.append(r.record_id)
@@ -206,6 +208,24 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
                 enqueue_index_chain(queue, did)
 
     failed = [r for r in results if r.status == "failed"]
+    # Candidate listing only (HTML scrape without download)
+    if listed and not downloaded_ids and not failed:
+        msg = listed[0].message if listed else "listed"
+        _progress(queue, job, pct=100.0, message=msg[:120])
+        return {
+            "results": [
+                {
+                    "status": r.status,
+                    "message": r.message,
+                    "record_id": r.record_id,
+                    "path": str(r.path) if r.path else None,
+                }
+                for r in results
+            ],
+            "download_ids": [],
+            "paths": [],
+            "listed": True,
+        }
     # No successful artifact → treat as job failure (visible in queue / retry)
     if not downloaded_ids:
         msgs = "; ".join(r.message for r in failed) if failed else "no media downloaded"

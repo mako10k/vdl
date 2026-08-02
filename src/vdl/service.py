@@ -97,7 +97,13 @@ class DownloadService:
         source_type: SourceType | None = None,
         select_all: bool = False,
         auto_yes: bool = False,
+        list_only: bool = False,
     ) -> list[ActionResult]:
+        """
+        Process a URL. For HTML pages:
+        - list_only=True (default for candidates UX): scrape and show candidates only
+        - list_only=False with auto_yes/select_all/prompt: download selected media
+        """
         url = url.strip()
         self._phase("classifying", 1.0)
 
@@ -150,12 +156,20 @@ class DownloadService:
 
         if classified.kind == ResourceKind.HTML:
             return self._handle_html(
-                classified, select_all=select_all, auto_yes=auto_yes
+                classified,
+                select_all=select_all,
+                auto_yes=auto_yes,
+                list_only=list_only,
             )
 
         # UNKNOWN: try as HTML fetch (design D1)
         console.print("[yellow]種別を判定できませんでした。HTML として取得を試みます。[/yellow]")
-        return self._handle_html(classified, select_all=select_all, auto_yes=auto_yes)
+        return self._handle_html(
+            classified,
+            select_all=select_all,
+            auto_yes=auto_yes,
+            list_only=list_only,
+        )
 
     def _handle_local_path(
         self,
@@ -471,49 +485,40 @@ class DownloadService:
     # HTML scrape
     # ------------------------------------------------------------------
 
-    def _handle_html(
-        self,
-        res: ClassifiedResource,
-        *,
-        select_all: bool,
-        auto_yes: bool,
-    ) -> list[ActionResult]:
-        page_url = res.final_url or res.url
-        try:
-            r = self.client.get(
-                page_url,
-                headers={**self.client.headers, **self.headers},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            html = r.text
-            page_url = str(r.url)
-        except Exception as e:
-            console.print(f"[red]ページ取得失敗[/red] {e}")
-            return [ActionResult(status="failed", message=str(e))]
-
-        candidates = extract_candidates(html, page_url)
-        if not candidates:
-            console.print("[yellow]動画・インデックス候補が見つかりませんでした。[/yellow]")
-            return [ActionResult(status="listed", message="候補なし")]
-
-        # Annotate with registry status
-        rows: list[tuple[MediaCandidate, Optional[object]]] = []
+    def fetch_html_candidates(
+        self, page_url: str
+    ) -> tuple[str, list[tuple[MediaCandidate, object | None]]]:
+        """
+        Fetch page and return (final_page_url, [(candidate, registry_record_or_None)]).
+        """
+        r = self.client.get(
+            page_url,
+            headers={**self.client.headers, **self.headers},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        final = str(r.url)
+        candidates = extract_candidates(r.text, final)
+        rows: list[tuple[MediaCandidate, object | None]] = []
         for c in candidates:
-            fp = None
             existing = self.registry.is_downloaded(normalize_url(c.url))
             rows.append((c, existing))
+        return final, rows
 
-        table = Table(title=f"メディア候補 ({len(candidates)}) — {page_url}")
+    def print_candidates_table(
+        self,
+        page_url: str,
+        rows: list[tuple[MediaCandidate, object | None]],
+    ) -> None:
+        table = Table(title=f"メディア候補 ({len(rows)}) — {page_url}")
         table.add_column("#", style="bold", width=4)
-        table.add_column("状態", width=12)
+        table.add_column("状態", width=14)
         table.add_column("種別", width=8)
         table.add_column("ソース", width=12)
         table.add_column("URL / タイトル")
-
         for i, (c, existing) in enumerate(rows, start=1):
-            if existing:
-                status = f"[yellow]済 id={existing.id}[/yellow]"
+            if existing is not None:
+                status = f"[yellow]済 id={getattr(existing, 'id', '?')}[/yellow]"
             elif is_mpd_url(c.url):
                 status = "[red]非対応[/red]"
             else:
@@ -528,9 +533,46 @@ class DownloadService:
                 c.url + note + title_bit,
             )
         console.print(table)
+        console.print(
+            "[dim]取得するには: vdl get '<url>' --enqueue "
+            "または vdl candidates '<page>' --enqueue[/dim]"
+        )
+        console.print(
+            "[dim]  -y / --all で選択省略（--enqueue と併用）。"
+            "番号指定は対話時のみ。[/dim]"
+        )
 
-        # Selection
-        def _is_actionable(c: MediaCandidate, existing: object) -> bool:
+    def _handle_html(
+        self,
+        res: ClassifiedResource,
+        *,
+        select_all: bool,
+        auto_yes: bool,
+        list_only: bool = False,
+    ) -> list[ActionResult]:
+        page_url = res.final_url or res.url
+        try:
+            page_url, rows = self.fetch_html_candidates(page_url)
+        except Exception as e:
+            console.print(f"[red]ページ取得失敗[/red] {e}")
+            return [ActionResult(status="failed", message=str(e))]
+
+        if not rows:
+            console.print("[yellow]動画・インデックス候補が見つかりませんでした。[/yellow]")
+            return [ActionResult(status="listed", message="候補なし")]
+
+        self.print_candidates_table(page_url, rows)
+
+        # list-only: do not download (default for candidates / get without --enqueue)
+        if list_only and not select_all and not auto_yes:
+            return [
+                ActionResult(
+                    status="listed",
+                    message=f"{len(rows)} candidates from {page_url}",
+                )
+            ]
+
+        def _is_actionable(c: MediaCandidate, existing: object | None) -> bool:
             if existing is not None:
                 return False
             if is_mpd_url(c.url):
@@ -543,7 +585,6 @@ class DownloadService:
         if select_all:
             chosen_idx = list(range(len(rows)))
         elif auto_yes:
-            # download all new only (skip MPD / already-done)
             chosen_idx = new_indices
             if not chosen_idx:
                 console.print(
@@ -579,14 +620,42 @@ class DownloadService:
                 continue
 
             console.print(f"\n[bold]#{i+1} をダウンロード[/bold] {c.url}")
-            # Re-enter process for this media URL
             sub = self.process_url(
                 c.url,
                 parent_page_url=page_url,
                 source_type=SourceType.FROM_HTML,
+                list_only=False,
             )
             results.extend(sub)
         return results
+
+    def select_candidate_indices(
+        self,
+        rows: list[tuple[MediaCandidate, object | None]],
+        *,
+        select_all: bool = False,
+        auto_yes: bool = False,
+        interactive: bool = True,
+    ) -> list[int] | None:
+        """Return 0-based indices to act on, or None if cancelled."""
+
+        def _is_actionable(c: MediaCandidate, existing: object | None) -> bool:
+            if existing is not None and not self.force:
+                return False
+            if is_mpd_url(c.url):
+                return False
+            return True
+
+        new_indices = [
+            i for i, (c, ex) in enumerate(rows) if _is_actionable(c, ex)
+        ]
+        if select_all:
+            return list(range(len(rows)))
+        if auto_yes:
+            return new_indices if new_indices else []
+        if not interactive:
+            return []
+        return self._prompt_selection(len(rows), new_indices)
 
     def _prompt_selection(
         self, n: int, new_indices: list[int]
