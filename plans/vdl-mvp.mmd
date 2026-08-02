@@ -1,0 +1,56 @@
+flowchart LR
+  %% perttool:profile {"schema_version":"Perttool.MermaidProfile.v1","profile":"perttool","source_fidelity":"semantic-v1","record_count":20,"metadata_digest":"sha256:831b8754d54b7810f97935ad74c646157766ce6faa727cdfdb95e305e83b7e6e","projection_digest":"sha256:0ce6684399edc251696e22bfffc80f7f1e500e54cb8d2692047f44d7d31a7e9f","projection":{"schema_version":"Perttool.MermaidProjection.v1","direction":"LR","analysis":"none","capacity_overrides":[]}}
+  %% perttool:project {"id":"VDL_MVP","version":1,"title":"vdl MVP — design-aligned video download CLI","description":"Implements the finalized architecture thought (vdl-architecture):\nResourceKind routing (video / index / html / unknown),\nSQLite download registry with URL + m3u8 fingerprint dedupe,\nHTML scrape + interactive selection, HLS via ffmpeg, CLI surface.\nExisting src/vdl prototype is treated as a draft; converge to design.","as_of":"2026-08-02","duration_unit":"hour","velocity":null,"finish":"RELEASED","critical_epsilon":"0h","target_duration":null}
+  %% perttool:resource {"id":"DEV","title":"Developer","description":null,"capacity":1,"tags":[]}
+  %% perttool:milestone {"id":"CLI_DONE","title":"CLI commands and options match design D11/D12","description":null,"state":"planned","tags":[]}
+  %% perttool:milestone {"id":"FOUNDATION_DONE","title":"Registry + classification foundation done","description":null,"state":"planned","tags":[]}
+  %% perttool:milestone {"id":"GAP_BASELINED","title":"Prototype vs design gap baselined","description":null,"state":"planned","tags":[]}
+  %% perttool:milestone {"id":"HTML_PATH_DONE","title":"HTML scrape + selection UX done","description":null,"state":"planned","tags":[]}
+  %% perttool:milestone {"id":"MEDIA_PATHS_DONE","title":"Direct video + m3u8 paths done","description":null,"state":"planned","tags":[]}
+  %% perttool:milestone {"id":"NOW","title":"Now — architecture design finalized (llmthink vdl-architecture)","description":null,"state":"reached","tags":[]}
+  %% perttool:milestone {"id":"QUALITY_DONE","title":"Tests and docs done","description":null,"state":"planned","tags":[]}
+  %% perttool:milestone {"id":"RELEASED","title":"MVP accepted","description":null,"state":"planned","tags":[]}
+  %% perttool:task {"id":"CLASSIFY_IMPL","from":"GAP_BASELINED","to":"FOUNDATION_DONE","title":"Harden ResourceKind classification (D1, EV4)","description":"content-type > body sniff > extension > bare path as html;\nunknown fallback behavior; unit tests for matrix cases.","estimate":{"kind":"deterministic","duration":"2h"},"status":"planned","priority":85,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"CLI_IMPL","from":"HTML_PATH_DONE","to":"CLI_DONE","title":"CLI surface alignment (D11, D12, D13)","description":"get/list/status/info/open-dir; --home -q -f -H -y --all --timeout;\nmodule boundaries: cli -> service -> adapters/registry.","estimate":{"kind":"deterministic","duration":"1h"},"status":"planned","priority":70,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"DOCS_IMPL","from":"CLI_DONE","to":"QUALITY_DONE","title":"Sync README with design and usage","description":"Document three URL modes, registry paths, selection UX, non-goals.\nLink docs/design/vdl-architecture.dsl.","estimate":{"kind":"deterministic","duration":"1h"},"status":"planned","priority":50,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"E2E_VERIFY","from":"QUALITY_DONE","to":"RELEASED","title":"Manual acceptance of D1-D15 scenarios","description":"Run acceptance checklist: direct video, duplicate skip, m3u8,\nhtml select, force re-download, status/list, VDL_HOME isolation.","estimate":{"kind":"deterministic","duration":"2h"},"status":"planned","priority":40,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"GAP_AUDIT","from":"NOW","to":"GAP_BASELINED","title":"Audit src/vdl against design decisions D1-D15","description":"Map each design decision to current code; list gaps (MPD error,\nfailed-not-duplicate SQL, fingerprint rules, CLI flags, tests).","estimate":{"kind":"deterministic","duration":"1h"},"status":"planned","priority":100,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"HTML_IMPL","from":"MEDIA_PATHS_DONE","to":"HTML_PATH_DONE","title":"HTML scrape and selection (D4, D8, D9)","description":"Extract candidates from tags/meta/jsonld/script;\nshow 済/新規 with registry id+path; selection new/all/ranges;\nre-enter video/index pipelines with source_type=from_html.","estimate":{"kind":"deterministic","duration":"3h"},"status":"planned","priority":75,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"M3U8_IMPL","from":"FOUNDATION_DONE","to":"MEDIA_PATHS_DONE","title":"m3u8 path (D3, D10, PD1 boundary)","description":"Master variant quality selection; media fingerprint;\nffmpeg -c copy with bsf fallback; MPD explicit unsupported error;\nlive/encrypted out of scope messaging.","estimate":{"kind":"deterministic","duration":"3h"},"status":"planned","priority":80,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"REGISTRY_IMPL","from":"GAP_BASELINED","to":"FOUNDATION_DONE","title":"Harden registry (D5, D6, D7, EV8)","description":"Ensure completed-only lookup with correct SQL parentheses;\nfingerprint + URL is_downloaded; failed does not block retry;\nschema matches design columns; add focused unit tests.","estimate":{"kind":"deterministic","duration":"2h"},"status":"planned","priority":90,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"TEST_IMPL","from":"CLI_DONE","to":"QUALITY_DONE","title":"Regression tests for registry, classify, scrape, e2e","description":"Unit tests without network; local http.server integration for\nvideo skip, m3u8 real segment, html candidate table.","estimate":{"kind":"deterministic","duration":"3h"},"status":"planned","priority":60,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:task {"id":"VIDEO_IMPL","from":"FOUNDATION_DONE","to":"MEDIA_PATHS_DONE","title":"Direct video path (D2)","description":"Stream download, progress, hash, registry complete/skip/force.","estimate":{"kind":"deterministic","duration":"2h"},"status":"planned","priority":80,"requires":[{"resource_id":"DEV","units":1}],"owner":null,"tags":[],"blocked_reason":null,"source":null}
+  %% perttool:projection-begin
+  ptm_CLI_DONE(("CLI_DONE: CLI commands and options match design D11/D12"))
+  ptm_FOUNDATION_DONE(("FOUNDATION_DONE: Registry + classification foundation done"))
+  ptm_GAP_BASELINED(("GAP_BASELINED: Prototype vs design gap baselined"))
+  ptm_HTML_PATH_DONE(("HTML_PATH_DONE: HTML scrape + selection UX done"))
+  ptm_MEDIA_PATHS_DONE(("MEDIA_PATHS_DONE: Direct video + m3u8 paths done"))
+  ptm_NOW(("NOW: Now — architecture design finalized (llmthink vdl-architecture)"))
+  ptm_QUALITY_DONE(("QUALITY_DONE: Tests and docs done"))
+  ptm_RELEASED(("RELEASED: MVP accepted"))
+  ptm_GAP_BASELINED -->|"CLASSIFY_IMPL: Harden ResourceKind classification (D1, EV4)"| ptm_FOUNDATION_DONE
+  ptm_HTML_PATH_DONE -->|"CLI_IMPL: CLI surface alignment (D11, D12, D13)"| ptm_CLI_DONE
+  ptm_CLI_DONE -->|"DOCS_IMPL: Sync README with design and usage"| ptm_QUALITY_DONE
+  ptm_QUALITY_DONE -->|"E2E_VERIFY: Manual acceptance of D1-D15 scenarios"| ptm_RELEASED
+  ptm_NOW -->|"GAP_AUDIT: Audit src/vdl against design decisions D1-D15"| ptm_GAP_BASELINED
+  ptm_MEDIA_PATHS_DONE -->|"HTML_IMPL: HTML scrape and selection (D4, D8, D9)"| ptm_HTML_PATH_DONE
+  ptm_FOUNDATION_DONE -->|"M3U8_IMPL: m3u8 path (D3, D10, PD1 boundary)"| ptm_MEDIA_PATHS_DONE
+  ptm_GAP_BASELINED -->|"REGISTRY_IMPL: Harden registry (D5, D6, D7, EV8)"| ptm_FOUNDATION_DONE
+  ptm_CLI_DONE -->|"TEST_IMPL: Regression tests for registry, classify, scrape, e2e"| ptm_QUALITY_DONE
+  ptm_FOUNDATION_DONE -->|"VIDEO_IMPL: Direct video path (D2)"| ptm_MEDIA_PATHS_DONE
+  classDef pt_milestone_planned fill:#ffffff,stroke:#566573,stroke-width:1px;
+  classDef pt_milestone_reached fill:#d5f5e3,stroke:#1e8449,stroke-width:2px;
+  class ptm_CLI_DONE,ptm_FOUNDATION_DONE,ptm_GAP_BASELINED,ptm_HTML_PATH_DONE,ptm_MEDIA_PATHS_DONE,ptm_QUALITY_DONE,ptm_RELEASED pt_milestone_planned;
+  class ptm_NOW pt_milestone_reached;
+  linkStyle 0 stroke:#34495e,stroke-width:2px;
+  linkStyle 1 stroke:#34495e,stroke-width:2px;
+  linkStyle 2 stroke:#34495e,stroke-width:2px;
+  linkStyle 3 stroke:#34495e,stroke-width:2px;
+  linkStyle 4 stroke:#34495e,stroke-width:2px;
+  linkStyle 5 stroke:#34495e,stroke-width:2px;
+  linkStyle 6 stroke:#34495e,stroke-width:2px;
+  linkStyle 7 stroke:#34495e,stroke-width:2px;
+  linkStyle 8 stroke:#34495e,stroke-width:2px;
+  linkStyle 9 stroke:#34495e,stroke-width:2px;
+  %% perttool:projection-end
