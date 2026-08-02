@@ -26,12 +26,18 @@ index = [
     "open-clip-torch>=2.24",
     "Pillow>=10.0",
 ]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
 
 [project.scripts]
 vdl = "vdl.cli:main"
+vdl-api = "api.main:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["vdl*", "api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

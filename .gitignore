@@ -16,6 +16,8 @@ daemon.pid
 supervisor.log
 supervisor.pid
 .pytest_cache/
+web/node_modules/
+web/dist/
 .mypy_cache/
 .ruff_cache/
 .llmthink/

@@ -176,3 +176,18 @@ pip install -e ".[dev,index]"
 pytest
 python -m vdl daemon status
 ```
+
+## Web UI (Vite + FastAPI)
+
+```bash
+pip install -e ".[web]"
+# API
+uvicorn api.main:app --reload --port 8000
+# Frontend
+cd web && npm install && npm run dev
+```
+
+- UI: http://127.0.0.1:5173  
+- API docs: http://127.0.0.1:8000/docs  
+
+詳細は [`web/README.md`](web/README.md)。
