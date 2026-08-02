@@ -1,45 +1,32 @@
 # vdl 設計・計画
 
-## 設計（llmthink）
+## 1. コア DL（llmthink `vdl-architecture`）
 
 | 項目 | 値 |
 |------|-----|
 | DSL | [`vdl-architecture.dsl`](./vdl-architecture.dsl) |
-| thought id | `vdl-architecture` |
-| 状態 | **finalized** |
-| 監査 | fatal=0 / error=0 / warning=0 |
+| 状態 | finalized |
+| ギャップ | [`gap-audit.md`](./gap-audit.md) |
+| 計画 | [`../../plans/vdl-mvp.pert`](../../plans/vdl-mvp.pert) |
 
-確認:
-
-```bash
-llmthink thought show --id vdl-architecture summary
-llmthink thought show --id vdl-architecture final
-```
-
-### 決定サマリ
-
-1. **ResourceKind** = video / index / html / unknown（排他）
-2. **video** → レジストリ照会 → 直 DL
-3. **index (m3u8)** → fingerprint 重複判定 → ffmpeg 結合（MPD は MVP 外）
-4. **html** → 候補抽出 → 済/新規表示 → 選択 → video/index 再入
-5. **レジストリ** = SQLite `~/.vdl/registry.db`（completed のみ重複）
-6. **CLI** = `get` / `list` / `status` / `info`（`vdl`）
-7. 既存 `src/vdl` はドラフトとして設計に収束
-
-## 計画（perttool）
+## 2. キュー / デーモン / ベクトル索引（llmthink `vdl-queue-index`）
 
 | 項目 | 値 |
 |------|-----|
-| PERT | [`../../plans/vdl-mvp.pert`](../../plans/vdl-mvp.pert) |
-| Mermaid | [`../../plans/vdl-mvp.mmd`](../../plans/vdl-mvp.mmd) |
-| 先行制約 makespan | 15h |
-| リソース制約 makespan | 20h（DEV capacity=1） |
-| 状態 | **RELEASED**（全タスク done） |
-| ギャップ監査 | [`gap-audit.md`](./gap-audit.md) |
+| DSL | [`vdl-queue-index.dsl`](./vdl-queue-index.dsl) |
+| 状態 | finalized |
+| 計画 | [`../../plans/vdl-queue-index.pert`](../../plans/vdl-queue-index.pert) |
+
+### 決定サマリ
+
+1. 全作業を **jobs キュー**（download 優先度 100 > 索引 40/30/20）
+2. デーモン単一ワーカー、`claim_next` で priority 順
+3. 索引: **scene_detect → clip_optimize → embed (Ollama)**
+4. Chroma は modality 別コレクション（CLIP 512d / text 768d）
+5. CLI は `get`（enqueue）/ `queue` / `daemon` / `registry`
 
 ```bash
-perttool document check plans/vdl-mvp.pert
-perttool dag analyze plans/vdl-mvp.pert
-perttool dag next plans/vdl-mvp.pert   # 完了後は推奨タスクなし
+llmthink thought show --id vdl-queue-index summary
+perttool document check plans/vdl-queue-index.pert
 pytest
 ```
