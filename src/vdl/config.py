@@ -53,6 +53,9 @@ SUPERVISOR_ENABLED = os.environ.get("VDL_SUPERVISOR", "1").strip() not in {
     "no",
     "off",
 }
+# Queue list: show done jobs only if recent (minutes) or latest of each kind.
+LIST_DONE_MINUTES = float(os.environ.get("VDL_LIST_DONE_MINUTES", "10"))
+LIST_LIMIT = int(os.environ.get("VDL_LIST_LIMIT", "30"))
 
 
 class Config:
@@ -72,6 +75,8 @@ class Config:
         self.daemon_auto_reload = DAEMON_AUTO_RELOAD
         self.supervisor_idle_sec = SUPERVISOR_IDLE_SEC
         self.supervisor_enabled = SUPERVISOR_ENABLED
+        self.list_done_minutes = LIST_DONE_MINUTES
+        self.list_limit = max(1, LIST_LIMIT)
 
     def ensure_dirs(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)

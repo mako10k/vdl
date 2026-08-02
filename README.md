@@ -42,11 +42,13 @@ vdl get 'https://example.com/video.mp4'
 vdl get 'https://example.com/master.m3u8' -q best
 
 # キュー監視（progress / ETA 付き）
-vdl queue list
+vdl queue list              # 古い done は既定で非表示（直近10分＋種別最終のみ）
+vdl queue list --all-done   # done 履歴も表示
+vdl queue list -n 20 --done-within 30
 vdl queue show 1
-vdl watch              # ライブ更新（Ctrl+C で終了）
+vdl watch                   # ライブ更新（Ctrl+C で終了）
 vdl watch --active -n 0.5
-vdl watch --until-idle # キュー空になったら終了
+vdl watch --until-idle      # キュー空になったら終了
 vdl registry list      # index 進捗 % も表示
 vdl daemon status
 

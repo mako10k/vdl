@@ -144,6 +144,68 @@ def filename_from_url(url: str, default: str = "download") -> str:
     return safe_filename(base)
 
 
+# Common playlist / generic basenames that collide across different URLs.
+_GENERIC_STEMS = frozenset(
+    {
+        "index",
+        "playlist",
+        "master",
+        "media",
+        "video",
+        "stream",
+        "download",
+        "chunklist",
+        "manifest",
+        "output",
+        "file",
+        "default",
+        "main",
+        "hls",
+        "vod",
+    }
+)
+
+
+def artifact_filename(
+    url: str,
+    *,
+    preferred: str | None = None,
+    ext: str | None = None,
+    content_key: str | None = None,
+    max_stem: int = 80,
+) -> str:
+    """
+    Build a stable, collision-resistant filename for a download.
+
+    - Prefer non-generic basename from URL / preferred hint
+    - Always append a short hash of canonical URL (or content_key) so different
+      streams never share the same path stem
+    - Generic names (index, playlist, …) use host slug instead of the generic stem
+    """
+    key = content_key or normalize_url(url)
+    short = sha256_text(key)[:10]
+
+    raw = preferred or filename_from_url(url, default="")
+    raw = safe_filename(raw) if raw else ""
+    stem = Path(raw).stem if raw else ""
+    # Forced ext wins (e.g. HLS → .mp4 even if URL ends with .m3u8)
+    if ext:
+        suffix = ext if ext.startswith(".") else f".{ext}"
+    elif raw and Path(raw).suffix:
+        suffix = Path(raw).suffix
+    else:
+        suffix = ".bin"
+
+    if not stem or stem.lower() in _GENERIC_STEMS:
+        host = urlparse(url).netloc or "media"
+        host = re.sub(r"[^A-Za-z0-9._-]+", "_", host).strip("._") or "media"
+        stem = host[:max_stem]
+    else:
+        stem = stem[:max_stem]
+
+    return safe_filename(f"{stem}_{short}{suffix}")
+
+
 def sha256_file(path: Path, chunk: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -160,14 +222,18 @@ def sha256_text(text: str) -> str:
 
 
 def unique_path(directory: Path, filename: str) -> Path:
-    """Return a non-colliding path inside directory."""
+    """
+    Return a non-colliding path inside directory.
+    If basename collides, append _2, _3, … (hash-based names usually avoid this).
+    """
     directory.mkdir(parents=True, exist_ok=True)
+    filename = safe_filename(filename)
     candidate = directory / filename
     if not candidate.exists():
         return candidate
     stem = candidate.stem
     suffix = candidate.suffix
-    n = 1
+    n = 2
     while True:
         alt = directory / f"{stem}_{n}{suffix}"
         if not alt.exists():

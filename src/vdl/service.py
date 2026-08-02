@@ -21,6 +21,7 @@ from vdl.m3u8_dl import (
 from vdl.registry import Registry, SourceType
 from vdl.scraper import MediaCandidate, extract_candidates
 from vdl.util import (
+    artifact_filename,
     filename_from_url,
     is_index_extension,
     is_mpd_url,
@@ -280,13 +281,18 @@ class DownloadService:
                 record_id=existing.id,
             )
 
+        fname = artifact_filename(
+            target,
+            preferred=res.filename_hint or filename_from_url(target),
+            ext=None,
+        )
         rec = self.registry.create(
             target,
             canonical_url=canonical,
             source_type=source_type,
             content_type=res.content_type,
             parent_page_url=parent_page_url,
-            title=res.filename_hint or filename_from_url(target),
+            title=fname,
         )
         try:
             self._phase("downloading", 5.0)
@@ -303,7 +309,7 @@ class DownloadService:
                 self.client,
                 target,
                 self.config.download_dir,
-                filename=res.filename_hint,
+                filename=fname,
                 headers=self.headers or None,
                 on_progress=_dl_prog,
             )
@@ -401,9 +407,16 @@ class DownloadService:
                 record_id=existing.id,
             )
 
-        title = res.filename_hint or filename_from_url(target, default="stream")
-        if title.endswith(".m3u8"):
-            title = title[: -len(".m3u8")] + ".mp4"
+        # Prefer stable unique name: host_hash.mp4 (avoid all becoming index.mp4)
+        preferred = res.filename_hint or filename_from_url(target, default="stream")
+        if preferred.endswith(".m3u8") or preferred.endswith(".m3u"):
+            preferred = preferred.rsplit(".", 1)[0] + ".mp4"
+        title = artifact_filename(
+            target,
+            preferred=preferred,
+            ext=".mp4",
+            content_key=info.fingerprint or canonical,
+        )
 
         rec = self.registry.create(
             target,
@@ -425,12 +438,12 @@ class DownloadService:
             self._phase(f"hls download (~{segs} segs)", 15.0)
             console.print(
                 f"[cyan]HLS ダウンロード中[/cyan] segments≈{info.segment_count} "
-                f"duration≈{info.duration_approx or '?'}s"
+                f"duration≈{info.duration_approx or '?'}s → {title}"
             )
             path, size = download_m3u8_ffmpeg(
                 info.media_playlist_url,
                 self.config.download_dir,
-                filename=title if title.endswith(".mp4") else title + ".mp4",
+                filename=title,
                 headers=self.headers or None,
             )
             self._phase("hashing", 95.0)

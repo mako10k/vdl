@@ -329,6 +329,87 @@ class JobQueue:
             ).fetchall()
             return [self._row(r) for r in rows]
 
+    def list_jobs_display(
+        self,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int = 30,
+        done_within_minutes: float = 10.0,
+        include_all_done: bool = False,
+        major_kinds: tuple[str, ...] | None = None,
+    ) -> tuple[list[Job], dict[str, Any]]:
+        """
+        List jobs for CLI/watch with done-history collapsed.
+
+        Default keeps:
+        - all non-done (pending/running/failed/cancelled)
+        - done jobs finished within done_within_minutes
+        - the latest done job per major kind (download / index stages / reload)
+
+        Returns (jobs, meta) where meta explains filtering for the UI.
+        """
+        kinds = major_kinds or (
+            JobKind.DOWNLOAD.value,
+            JobKind.SCENE_DETECT.value,
+            JobKind.CLIP_OPTIMIZE.value,
+            JobKind.EMBED.value,
+            JobKind.DAEMON_RELOAD.value,
+        )
+        # Fetch a wider window then filter (simple, portable).
+        fetch_n = max(limit * 8, 80)
+        raw = self.list_jobs(status=status, kind=kind, limit=fetch_n)
+
+        if include_all_done or status == "done":
+            rows = raw[:limit]
+            return rows, {
+                "filtered": False,
+                "hidden_done": 0,
+                "done_within_minutes": done_within_minutes,
+                "limit": limit,
+            }
+
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - max(0.0, done_within_minutes) * 60.0
+        latest_done_by_kind: dict[str, int] = {}
+        for j in raw:
+            if j.status != "done":
+                continue
+            if j.kind not in latest_done_by_kind:
+                latest_done_by_kind[j.kind] = j.id
+
+        def _keep(j: Job) -> bool:
+            if j.status != "done":
+                return True
+            # recent done
+            ts_src = j.finished_at or j.updated_at
+            try:
+                ts = datetime.fromisoformat(ts_src.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts.timestamp() >= cutoff:
+                    return True
+            except Exception:
+                pass
+            # latest of major kind
+            if j.kind in kinds and latest_done_by_kind.get(j.kind) == j.id:
+                return True
+            return False
+
+        kept = [j for j in raw if _keep(j)]
+        hidden = sum(1 for j in raw if j.status == "done" and not _keep(j))
+        # Prefer active jobs first, then by id desc (already desc)
+        active_order = {"running": 0, "pending": 1, "failed": 2, "cancelled": 3, "done": 4}
+        kept.sort(key=lambda j: (active_order.get(j.status, 9), -j.id))
+        rows = kept[:limit]
+        return rows, {
+            "filtered": True,
+            "hidden_done": hidden,
+            "done_within_minutes": done_within_minutes,
+            "limit": limit,
+            "latest_done_kinds": latest_done_by_kind,
+        }
+
     def find_active_reload(self) -> Optional[Job]:
         """Pending or running daemon_reload job (newest)."""
         with self._conn() as conn:

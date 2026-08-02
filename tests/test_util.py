@@ -34,7 +34,7 @@ def test_unique_path(tmp_path: Path) -> None:
     p1 = unique_path(tmp_path, "f.mp4")
     p1.write_text("a")
     p2 = unique_path(tmp_path, "f.mp4")
-    assert p2.name == "f_1.mp4"
+    assert p2.name == "f_2.mp4"
 
 
 def test_sha256(tmp_path: Path) -> None:

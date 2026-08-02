@@ -99,12 +99,19 @@ def _watch_dashboard(
     *,
     limit: int = 20,
     active_only: bool = False,
+    done_within_minutes: float | None = None,
+    include_all_done: bool = False,
 ) -> Group:
     """Build a refreshable dashboard for `vdl watch`."""
     q = JobQueue(config.db_path)
     st = daemon_status(config)
     counts = q.counts()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    done_mins = (
+        float(done_within_minutes)
+        if done_within_minutes is not None
+        else float(config.list_done_minutes)
+    )
 
     sup = supervisor_status(config)
     if sup["running"]:
@@ -163,15 +170,25 @@ def _watch_dashboard(
         border_style="blue",
     )
 
+    filter_meta: dict = {}
     if active_only:
         running = q.list_jobs(status="running", limit=limit)
         pending = q.list_jobs(status="pending", limit=limit)
-        # merge running first, then pending, cap limit
-        rows = (running + pending)[:limit]
-        title = f"active jobs (running+pending, ≤{limit})"
+        failed = q.list_jobs(status="failed", limit=min(10, limit))
+        rows = (running + pending + failed)[:limit]
+        title = f"active jobs (running+pending+failed, ≤{limit})"
     else:
-        rows = q.list_jobs(limit=limit)
-        title = f"recent jobs (≤{limit})"
+        rows, filter_meta = q.list_jobs_display(
+            limit=limit,
+            done_within_minutes=done_mins,
+            include_all_done=include_all_done,
+        )
+        title = f"jobs (≤{limit}"
+        if filter_meta.get("filtered"):
+            title += f", done≤{done_mins:g}m + latest/kind"
+            if filter_meta.get("hidden_done"):
+                title += f", hidden_done={filter_meta['hidden_done']}"
+        title += ")"
 
     if rows:
         body: Table | Text = _jobs_table(rows, title=title)
@@ -407,14 +424,56 @@ def queue_group() -> None:
     ),
     default=None,
 )
-@click.option("-n", "--limit", default=30, show_default=True)
+@click.option(
+    "-n",
+    "--limit",
+    default=None,
+    type=int,
+    help="表示上限 (default: VDL_LIST_LIMIT / 30)",
+)
+@click.option(
+    "--done-within",
+    "done_within",
+    default=None,
+    type=float,
+    help="done を残す分数 (default: VDL_LIST_DONE_MINUTES / 10)",
+)
+@click.option(
+    "--all-done",
+    "include_all_done",
+    is_flag=True,
+    help="古い done もすべて表示候補に含める（limit 内）",
+)
 @click.pass_context
-def queue_list(ctx: click.Context, status: Optional[str], kind: Optional[str], limit: int) -> None:
+def queue_list(
+    ctx: click.Context,
+    status: Optional[str],
+    kind: Optional[str],
+    limit: Optional[int],
+    done_within: Optional[float],
+    include_all_done: bool,
+) -> None:
     config: Config = ctx.obj["config"]
     q = JobQueue(config.db_path)
-    rows = q.list_jobs(status=status, kind=kind, limit=limit)
+    lim = int(limit if limit is not None else config.list_limit)
+    mins = float(
+        done_within if done_within is not None else config.list_done_minutes
+    )
+    rows, meta = q.list_jobs_display(
+        status=status,
+        kind=kind,
+        limit=lim,
+        done_within_minutes=mins,
+        include_all_done=include_all_done or (status == "done"),
+    )
     counts = q.counts()
     console.print(f"[dim]counts={counts}[/dim]")
+    if meta.get("filtered"):
+        console.print(
+            f"[dim]filter: done last {mins:g}m + latest/kind; "
+            f"hidden_done≈{meta.get('hidden_done', 0)}; limit={lim} "
+            f"(--all-done で履歴全表示)[/dim]"
+        )
     if not rows:
         console.print("[dim]ジョブなし[/dim]")
         return
@@ -892,16 +951,28 @@ def registry_search(
 @click.option(
     "-l",
     "--limit",
-    default=20,
-    show_default=True,
+    default=None,
     type=int,
-    help="表示するジョブ件数",
+    help="表示するジョブ件数 (default: VDL_LIST_LIMIT)",
 )
 @click.option(
     "--active",
     "active_only",
     is_flag=True,
-    help="running / pending のみ表示",
+    help="running / pending / failed のみ表示",
+)
+@click.option(
+    "--all-done",
+    "include_all_done",
+    is_flag=True,
+    help="古い done も表示",
+)
+@click.option(
+    "--done-within",
+    "done_within",
+    default=None,
+    type=float,
+    help="done を残す分数",
 )
 @click.option(
     "--until-idle",
@@ -912,8 +983,10 @@ def registry_search(
 def watch_cmd(
     ctx: click.Context,
     interval: float,
-    limit: int,
+    limit: Optional[int],
     active_only: bool,
+    include_all_done: bool,
+    done_within: Optional[float],
     until_idle: bool,
 ) -> None:
     """
@@ -926,19 +999,30 @@ def watch_cmd(
     """
     config: Config = ctx.obj["config"]
     interval = max(0.2, float(interval))
+    lim = int(limit if limit is not None else config.list_limit)
+    mins = float(
+        done_within if done_within is not None else config.list_done_minutes
+    )
+
+    def _dash() -> Group:
+        return _watch_dashboard(
+            config,
+            limit=lim,
+            active_only=active_only,
+            done_within_minutes=mins,
+            include_all_done=include_all_done,
+        )
 
     try:
         with Live(
-            _watch_dashboard(config, limit=limit, active_only=active_only),
+            _dash(),
             console=console,
             refresh_per_second=max(1, int(1 / interval) if interval < 1 else 2),
             screen=False,
         ) as live:
             while True:
                 time.sleep(interval)
-                live.update(
-                    _watch_dashboard(config, limit=limit, active_only=active_only)
-                )
+                live.update(_dash())
                 if until_idle:
                     counts = JobQueue(config.db_path).counts()
                     if counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
