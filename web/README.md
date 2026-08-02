@@ -2,6 +2,17 @@
 
 Vite + React フロントエンドと FastAPI バックエンド。
 
+## ポート（既定）
+
+使用中ポートを避けるため、よくある `5173` / `8000` は使いません。
+
+| 役割 | 既定ポート | 環境変数 |
+|------|-----------|----------|
+| API (FastAPI) | **18765** | `VDL_API_PORT` |
+| UI (Vite) | **18766** | `VDL_WEB_PORT` |
+
+`web/.env` またはシェルで変更できます。
+
 ## 起動
 
 ```bash
@@ -13,17 +24,19 @@ cd web && npm install
 # ターミナル1: API
 cd /path/to/video
 export VDL_HOME=~/.vdl   # 任意
-uvicorn api.main:app --reload --port 8000
+export VDL_API_PORT=18765
+uvicorn api.main:app --reload --host 127.0.0.1 --port 18765
+# または: vdl-api
 
 # ターミナル2: UI
 cd web
 npm run dev
 ```
 
-ブラウザ: http://127.0.0.1:5173  
-API ドキュメント: http://127.0.0.1:8000/docs  
+- ブラウザ: http://127.0.0.1:18766  
+- API docs: http://127.0.0.1:18765/docs  
 
-開発時、Vite は `/api` を `8000` にプロキシします。
+開発時、Vite は `/api` を `VDL_API_PORT`（既定 18765）へプロキシします。
 
 ## 機能
 

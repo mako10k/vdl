@@ -408,10 +408,11 @@ def _hit_dict(h) -> dict[str, Any]:
 def main() -> None:
     import uvicorn
 
+    # Default 18765 — avoid common busy ports (8000/5173/4000/…).
     uvicorn.run(
         "api.main:app",
         host=os.environ.get("VDL_API_HOST", "127.0.0.1"),
-        port=int(os.environ.get("VDL_API_PORT", "8000")),
+        port=int(os.environ.get("VDL_API_PORT", "18765")),
         reload=os.environ.get("VDL_API_RELOAD", "0") == "1",
     )
 

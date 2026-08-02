@@ -179,15 +179,22 @@ python -m vdl daemon status
 
 ## Web UI (Vite + FastAPI)
 
+既定ポート（使用中の 5173 等を避ける）:
+
+| 役割 | ポート | 環境変数 |
+|------|--------|----------|
+| API | **18765** | `VDL_API_PORT` |
+| UI | **18766** | `VDL_WEB_PORT` |
+
 ```bash
 pip install -e ".[web]"
 # API
-uvicorn api.main:app --reload --port 8000
+uvicorn api.main:app --reload --host 127.0.0.1 --port 18765
 # Frontend
 cd web && npm install && npm run dev
 ```
 
-- UI: http://127.0.0.1:5173  
-- API docs: http://127.0.0.1:8000/docs  
+- UI: http://127.0.0.1:18766  
+- API docs: http://127.0.0.1:18765/docs  
 
 詳細は [`web/README.md`](web/README.md)。
