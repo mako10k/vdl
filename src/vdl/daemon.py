@@ -1,4 +1,4 @@
-"""Background worker: download-first queue, auto-start, idle auto-stop."""
+"""Background worker: download-first queue, parallel jobs, auto-start, idle stop."""
 
 from __future__ import annotations
 
@@ -7,10 +7,12 @@ import os
 import signal
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
+from typing import Any
 
-from vdl.config import DAEMON_IDLE_SEC, Config
-from vdl.queue import JobQueue
+from vdl.config import DAEMON_IDLE_SEC, DAEMON_WORKERS, Config
+from vdl.queue import Job, JobQueue
 from vdl.workers import run_job
 
 
@@ -76,6 +78,7 @@ def daemon_status(config: Config) -> dict:
         "log_file": str(config.daemon_log_path),
         "queue": q.counts(),
         "idle_sec": getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC),
+        "workers": getattr(config, "daemon_workers", DAEMON_WORKERS),
     }
 
 
@@ -85,6 +88,21 @@ def _queue_is_idle(queue: JobQueue) -> bool:
     return counts.get("pending", 0) == 0 and counts.get("running", 0) == 0
 
 
+def _execute_job(config: Config, job: Job) -> tuple[int, str, str | None]:
+    """
+    Run one job in a worker thread. Each thread uses its own JobQueue connection.
+    Returns (job_id, status, error_or_none).
+    """
+    queue = JobQueue(config.db_path)
+    try:
+        result = run_job(config, job)
+        queue.mark_done(job.id, result)
+        return job.id, "done", None
+    except Exception as e:
+        queue.mark_failed(job.id, str(e))
+        return job.id, "failed", str(e)
+
+
 def run_forever(
     config: Config,
     *,
@@ -92,18 +110,19 @@ def run_forever(
     foreground: bool = True,
     write_pid_file: bool = False,
     idle_sec: float | None = None,
+    workers: int | None = None,
 ) -> None:
     """
-    Worker loop.
-    If idle_sec > 0 and the queue stays empty (no pending/running) for that long,
-    exit gracefully. Default comes from config / VDL_DAEMON_IDLE_SEC.
-    idle_sec=0 or None with explicit 0 means never auto-stop.
+    Worker loop with a thread pool.
+    Claims up to `workers` runnable jobs in parallel (default 3).
+    Priority ordering is preserved by claim_next (highest priority first).
     """
     config.ensure_dirs()
     if idle_sec is None:
         idle_sec = float(getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC))
-    # Background daemons always use idle stop unless explicitly 0.
-    # Foreground without --pid defaults to no idle stop unless --idle is set by CLI.
+    max_workers = int(workers if workers is not None else getattr(config, "daemon_workers", DAEMON_WORKERS))
+    max_workers = max(1, max_workers)
+
     logger = _setup_logging(
         config.daemon_log_path if (not foreground or write_pid_file) else None,
         foreground=foreground,
@@ -122,48 +141,98 @@ def run_forever(
         write_pid(config.daemon_pid_path, os.getpid())
 
     logger.info(
-        "daemon started home=%s idle_sec=%s",
+        "daemon started home=%s workers=%s idle_sec=%s",
         config.home,
+        max_workers,
         idle_sec if idle_sec and idle_sec > 0 else "disabled",
     )
+
     idle_since: float | None = None
-    try:
-        while not state.stopping:
-            job = queue.claim_next()
-            if job:
-                idle_since = None
-                logger.info(
-                    "job start id=%s kind=%s priority=%s download_id=%s",
-                    job.id,
-                    job.kind,
-                    job.priority,
-                    job.download_id,
-                )
+    futures: dict[Future[Any], Job] = {}
+
+    def _drain_done() -> None:
+        nonlocal idle_since
+        finished = [f for f in list(futures) if f.done()]
+        for fut in finished:
+            job = futures.pop(fut)
+            try:
+                jid, status, err = fut.result()
+                if status == "done":
+                    logger.info("job done id=%s kind=%s", jid, job.kind)
+                else:
+                    logger.error("job failed id=%s kind=%s: %s", jid, job.kind, err)
+            except Exception as e:
+                logger.exception("job future error id=%s: %s", job.id, e)
                 try:
-                    result = run_job(config, job)
-                    queue.mark_done(job.id, result)
-                    logger.info("job done id=%s kind=%s", job.id, job.kind)
-                except Exception as e:
-                    queue.mark_failed(job.id, str(e))
-                    logger.exception("job failed id=%s: %s", job.id, e)
-                continue
+                    JobQueue(config.db_path).mark_failed(job.id, str(e))
+                except Exception:
+                    pass
 
-            # No claimable job right now
-            now = time.time()
-            if idle_sec and idle_sec > 0 and _queue_is_idle(queue):
-                if idle_since is None:
-                    idle_since = now
-                    logger.info("queue empty; idle timer started (%.0fs)", idle_sec)
-                elif (now - idle_since) >= idle_sec:
+    try:
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="vdl-job"
+        ) as pool:
+            while not state.stopping:
+                _drain_done()
+
+                # Fill free slots with highest-priority claimable jobs
+                claimed_any = False
+                while len(futures) < max_workers and not state.stopping:
+                    job = queue.claim_next()
+                    if not job:
+                        break
+                    claimed_any = True
+                    idle_since = None
                     logger.info(
-                        "idle timeout reached (%.0fs); shutting down", idle_sec
+                        "job start id=%s kind=%s priority=%s download_id=%s "
+                        "(active=%s/%s)",
+                        job.id,
+                        job.kind,
+                        job.priority,
+                        job.download_id,
+                        len(futures) + 1,
+                        max_workers,
                     )
-                    break
-            else:
-                # Work still pending (e.g. waiting on dependency) — don't idle-exit
-                idle_since = None
+                    fut = pool.submit(_execute_job, config, job)
+                    futures[fut] = job
 
-            time.sleep(poll_interval)
+                if futures:
+                    # Wait for at least one job to finish (or poll timeout)
+                    wait(
+                        list(futures.keys()),
+                        timeout=poll_interval,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    continue
+
+                # No active work and nothing claimable
+                if claimed_any:
+                    continue
+
+                now = time.time()
+                if idle_sec and idle_sec > 0 and _queue_is_idle(queue):
+                    if idle_since is None:
+                        idle_since = now
+                        logger.info(
+                            "queue empty; idle timer started (%.0fs)", idle_sec
+                        )
+                    elif (now - idle_since) >= idle_sec:
+                        logger.info(
+                            "idle timeout reached (%.0fs); shutting down", idle_sec
+                        )
+                        break
+                else:
+                    idle_since = None
+
+                time.sleep(poll_interval)
+
+            # Graceful: finish in-flight jobs
+            if futures:
+                logger.info(
+                    "waiting for %s in-flight job(s) before stop", len(futures)
+                )
+                wait(list(futures.keys()), timeout=3600)
+                _drain_done()
     finally:
         if write_pid_file:
             remove_pid(config.daemon_pid_path)
@@ -174,6 +243,7 @@ def start_background(
     config: Config,
     *,
     idle_sec: float | None = None,
+    workers: int | None = None,
 ) -> int:
     """Spawn `vdl daemon run --pid` in background; return child pid."""
     import subprocess
@@ -185,6 +255,8 @@ def start_background(
     config.ensure_dirs()
     if idle_sec is None:
         idle_sec = float(getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC))
+    if workers is None:
+        workers = int(getattr(config, "daemon_workers", DAEMON_WORKERS))
 
     cmd = [
         sys.executable,
@@ -197,6 +269,8 @@ def start_background(
         "--pid",
         "--idle",
         str(idle_sec),
+        "--workers",
+        str(max(1, workers)),
     ]
     logf = open(config.daemon_log_path, "a", encoding="utf-8")
     proc = subprocess.Popen(
@@ -219,6 +293,7 @@ def ensure_daemon_running(
     config: Config,
     *,
     idle_sec: float | None = None,
+    workers: int | None = None,
 ) -> tuple[int, bool]:
     """
     Ensure a background daemon is running.
@@ -227,14 +302,12 @@ def ensure_daemon_running(
     st = daemon_status(config)
     if st["running"] and st["pid"] is not None:
         return int(st["pid"]), False
-    # Stale pid file
     if st["pid"] and not st["running"]:
         remove_pid(config.daemon_pid_path)
     try:
-        pid = start_background(config, idle_sec=idle_sec)
+        pid = start_background(config, idle_sec=idle_sec, workers=workers)
         return pid, True
     except RuntimeError:
-        # Race: another process started it
         st2 = daemon_status(config)
         if st2["running"] and st2["pid"] is not None:
             return int(st2["pid"]), False

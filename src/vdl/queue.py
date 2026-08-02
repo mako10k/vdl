@@ -46,6 +46,11 @@ class Job:
     updated_at: str
     started_at: Optional[str]
     finished_at: Optional[str]
+    progress_pct: Optional[float] = 0.0
+    progress_msg: Optional[str] = None
+    progress_current: Optional[int] = None
+    progress_total: Optional[int] = None
+    eta_sec: Optional[float] = None
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -64,6 +69,70 @@ class Job:
             return json.loads(self.result_json)
         except json.JSONDecodeError:
             return {}
+
+    def progress_label(self, *, bar_width: int = 10) -> str:
+        """Human-readable progress for list views."""
+        if self.status == "pending":
+            return "queued"
+        if self.status == "cancelled":
+            return "cancelled"
+        if self.status == "failed":
+            pct = self.progress_pct if self.progress_pct is not None else 0.0
+            return f"failed @{pct:.0f}%"
+        if self.status == "done":
+            return "100% done"
+
+        pct = float(self.progress_pct or 0.0)
+        pct = max(0.0, min(100.0, pct))
+        filled = int(round(bar_width * pct / 100.0))
+        filled = min(bar_width, max(0, filled))
+        bar = "=" * filled + "-" * (bar_width - filled)
+        parts = [f"[{bar}] {pct:5.1f}%"]
+        if self.progress_current is not None and self.progress_total:
+            parts.append(f"{self.progress_current}/{self.progress_total}")
+        if self.progress_msg:
+            msg = self.progress_msg
+            if len(msg) > 28:
+                msg = msg[:25] + "…"
+            parts.append(msg)
+        eta = self.eta_sec
+        if eta is None:
+            eta = estimate_eta_sec(self.started_at, pct)
+        if eta is not None and self.status == "running" and pct < 100:
+            parts.append(f"ETA {format_duration(eta)}")
+        return " ".join(parts)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def estimate_eta_sec(started_at: str | None, progress_pct: float) -> float | None:
+    """Linear ETA from elapsed / progress ratio."""
+    if not started_at or progress_pct is None or progress_pct <= 0.5:
+        return None
+    if progress_pct >= 100:
+        return 0.0
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        if elapsed <= 0:
+            return None
+        total = elapsed / (progress_pct / 100.0)
+        return max(0.0, total - elapsed)
+    except Exception:
+        return None
 
 
 class JobQueue:
@@ -103,7 +172,12 @@ class JobQueue:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    progress_pct REAL DEFAULT 0,
+                    progress_msg TEXT,
+                    progress_current INTEGER,
+                    progress_total INTEGER,
+                    eta_sec REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
                     ON jobs(status, priority DESC, id ASC);
@@ -142,8 +216,23 @@ class JobQueue:
                     ON embeddings(scene_id);
                 """
             )
+            self._migrate_job_progress_columns(conn)
+
+    def _migrate_job_progress_columns(self, conn: sqlite3.Connection) -> None:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        migrations = [
+            ("progress_pct", "REAL DEFAULT 0"),
+            ("progress_msg", "TEXT"),
+            ("progress_current", "INTEGER"),
+            ("progress_total", "INTEGER"),
+            ("eta_sec", "REAL"),
+        ]
+        for name, decl in migrations:
+            if name not in cols:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
 
     def _row(self, row: sqlite3.Row) -> Job:
+        keys = row.keys()
         return Job(
             id=row["id"],
             kind=row["kind"],
@@ -158,6 +247,11 @@ class JobQueue:
             updated_at=row["updated_at"],
             started_at=row["started_at"],
             finished_at=row["finished_at"],
+            progress_pct=row["progress_pct"] if "progress_pct" in keys else 0.0,
+            progress_msg=row["progress_msg"] if "progress_msg" in keys else None,
+            progress_current=row["progress_current"] if "progress_current" in keys else None,
+            progress_total=row["progress_total"] if "progress_total" in keys else None,
+            eta_sec=row["eta_sec"] if "eta_sec" in keys else None,
         )
 
     def enqueue(
@@ -253,7 +347,15 @@ class JobQueue:
                 return None
             conn.execute(
                 """
-                UPDATE jobs SET status = 'running', started_at = ?, updated_at = ?
+                UPDATE jobs SET
+                    status = 'running',
+                    started_at = ?,
+                    updated_at = ?,
+                    progress_pct = 0,
+                    progress_msg = 'starting',
+                    progress_current = NULL,
+                    progress_total = NULL,
+                    eta_sec = NULL
                 WHERE id = ? AND status = 'pending'
                 """,
                 (now, now, row["id"]),
@@ -263,6 +365,46 @@ class JobQueue:
             ).fetchone()
             assert claimed is not None
             return self._row(claimed)
+
+    def update_progress(
+        self,
+        job_id: int,
+        *,
+        pct: float | None = None,
+        message: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        eta_sec: float | None = None,
+        started_at: str | None = None,
+    ) -> None:
+        """Best-effort progress update for list/status UIs."""
+        now = _utc_now()
+        if pct is not None:
+            pct = max(0.0, min(100.0, float(pct)))
+        # auto ETA if not provided
+        if eta_sec is None and pct is not None and started_at:
+            eta_sec = estimate_eta_sec(started_at, pct)
+        with self._conn() as conn:
+            # load started_at if needed for ETA
+            if eta_sec is None and pct is not None:
+                row = conn.execute(
+                    "SELECT started_at FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                if row and row["started_at"]:
+                    eta_sec = estimate_eta_sec(row["started_at"], pct)
+            conn.execute(
+                """
+                UPDATE jobs SET
+                    progress_pct = COALESCE(?, progress_pct),
+                    progress_msg = COALESCE(?, progress_msg),
+                    progress_current = COALESCE(?, progress_current),
+                    progress_total = COALESCE(?, progress_total),
+                    eta_sec = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (pct, message, current, total, eta_sec, now, job_id),
+            )
 
     def mark_done(
         self, job_id: int, result: dict[str, Any] | None = None
@@ -276,7 +418,10 @@ class JobQueue:
                     result_json = ?,
                     error = NULL,
                     finished_at = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    progress_pct = 100,
+                    progress_msg = 'done',
+                    eta_sec = 0
                 WHERE id = ?
                 """,
                 (
@@ -291,6 +436,99 @@ class JobQueue:
             ).fetchone()
             assert row is not None
             return self._row(row)
+
+    def index_status_for_download(self, download_id: int) -> dict[str, Any]:
+        """Aggregate index pipeline progress for a download (list UIs)."""
+        with self._conn() as conn:
+            scenes = conn.execute(
+                "SELECT COUNT(*) AS n FROM scenes WHERE download_id = ?",
+                (download_id,),
+            ).fetchone()["n"]
+            clip_n = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM embeddings
+                WHERE download_id = ? AND modality = 'clip'
+                """,
+                (download_id,),
+            ).fetchone()["n"]
+            text_n = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM embeddings
+                WHERE download_id = ? AND modality = 'text'
+                """,
+                (download_id,),
+            ).fetchone()["n"]
+            jobs = conn.execute(
+                """
+                SELECT kind, status, progress_pct, progress_msg
+                FROM jobs WHERE download_id = ?
+                ORDER BY id DESC
+                """,
+                (download_id,),
+            ).fetchall()
+        by_kind: dict[str, sqlite3.Row] = {}
+        for j in jobs:
+            if j["kind"] not in by_kind:
+                by_kind[j["kind"]] = j
+
+        # pipeline weights: scene 20 / clip 40 / embed 40
+        def stage_pct(kind: str) -> float:
+            j = by_kind.get(kind)
+            if not j:
+                # infer from artifacts
+                if kind == "scene_detect":
+                    return 100.0 if scenes > 0 else 0.0
+                if kind == "clip_optimize":
+                    if scenes <= 0:
+                        return 0.0
+                    return min(100.0, 100.0 * clip_n / scenes)
+                if kind == "embed":
+                    if scenes <= 0:
+                        return 0.0
+                    return min(100.0, 100.0 * text_n / scenes)
+                return 0.0
+            if j["status"] == "done":
+                return 100.0
+            if j["status"] == "failed":
+                return float(j["progress_pct"] or 0.0)
+            if j["status"] == "running":
+                return float(j["progress_pct"] or 0.0)
+            return 0.0  # pending
+
+        sp, cp, ep = (
+            stage_pct("scene_detect"),
+            stage_pct("clip_optimize"),
+            stage_pct("embed"),
+        )
+        overall = 0.2 * sp + 0.4 * cp + 0.4 * ep
+        active_msg = None
+        for kind in ("embed", "clip_optimize", "scene_detect"):
+            j = by_kind.get(kind)
+            if j and j["status"] == "running":
+                if j["progress_msg"]:
+                    active_msg = f"{kind}: {j['progress_msg']}"
+                else:
+                    active_msg = f"{kind}: {float(j['progress_pct'] or 0):.0f}%"
+                break
+            if j and j["status"] == "pending":
+                active_msg = f"queued {kind}"
+                break
+
+        return {
+            "scenes": scenes,
+            "clip_embeddings": clip_n,
+            "text_embeddings": text_n,
+            "scene_pct": sp,
+            "clip_pct": cp,
+            "embed_pct": ep,
+            "overall_pct": overall,
+            "message": active_msg
+            or (
+                "indexed"
+                if overall >= 99.9
+                else ("partial" if overall > 0 else "not indexed")
+            ),
+        }
 
     def mark_failed(self, job_id: int, error: str) -> Job:
         now = _utc_now()

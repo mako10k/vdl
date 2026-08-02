@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+
+# Chroma persistent client is not fully multi-thread safe across processes/threads.
+_store_lock = threading.Lock()
 
 
 class VectorStore:
@@ -55,26 +60,28 @@ class VectorStore:
         modality: str | None = None,
     ) -> str:
         mod = modality or str(metadata.get("modality") or "text")
-        col = self._collection(mod)
         cid = chroma_id or str(uuid4())
         meta = {k: v for k, v in metadata.items() if v is not None}
         meta["modality"] = mod
-        col.upsert(
-            ids=[cid],
-            embeddings=[embedding],
-            documents=[document],
-            metadatas=[meta],
-        )
+        with _store_lock:
+            col = self._collection(mod)
+            col.upsert(
+                ids=[cid],
+                embeddings=[embedding],
+                documents=[document],
+                metadatas=[meta],
+            )
         return cid
 
     def delete_for_download(self, download_id: int, modality: str | None = None) -> None:
         mods = [modality] if modality else list(self.COLLECTIONS.keys())
-        for mod in mods:
-            col = self._collection(mod)
-            try:
-                col.delete(where={"download_id": download_id})
-            except Exception:
-                pass
+        with _store_lock:
+            for mod in mods:
+                col = self._collection(mod)
+                try:
+                    col.delete(where={"download_id": download_id})
+                except Exception:
+                    pass
 
     def query(
         self,
@@ -83,12 +90,13 @@ class VectorStore:
         n_results: int = 10,
         modality: str = "text",
     ) -> list[dict[str, Any]]:
-        col = self._collection(modality)
-        res = col.query(
-            query_embeddings=[embedding],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"],
-        )
+        with _store_lock:
+            col = self._collection(modality)
+            res = col.query(
+                query_embeddings=[embedding],
+                n_results=n_results,
+                include=["documents", "metadatas", "distances"],
+            )
         out: list[dict[str, Any]] = []
         ids = (res.get("ids") or [[]])[0]
         docs = (res.get("documents") or [[]])[0]

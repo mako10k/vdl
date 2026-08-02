@@ -95,16 +95,63 @@ def run_job(config: Config, job: Job) -> dict[str, Any]:
     raise ValueError(f"unknown job kind: {job.kind}")
 
 
+def _progress(
+    queue: JobQueue,
+    job: Job,
+    *,
+    pct: float | None = None,
+    message: str | None = None,
+    current: int | None = None,
+    total: int | None = None,
+) -> None:
+    queue.update_progress(
+        job.id,
+        pct=pct,
+        message=message,
+        current=current,
+        total=total,
+        started_at=job.started_at,
+    )
+
+
 def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
     p = job.payload
     url = p["url"]
+    _progress(queue, job, pct=1.0, message="starting download")
+
+    def on_phase(message: str, pct: float | None) -> None:
+        _progress(queue, job, pct=pct, message=message)
+
+    def on_progress(written: int, total: int | None) -> None:
+        if total and total > 0:
+            pct = 5.0 + 90.0 * min(1.0, written / total)
+            _progress(
+                queue,
+                job,
+                pct=pct,
+                message=f"download {written}/{total} B",
+                current=written,
+                total=total,
+            )
+        else:
+            _progress(
+                queue,
+                job,
+                pct=None,
+                message=f"download {written} B",
+                current=written,
+            )
+
     with DownloadService(
         config,
         quality=p.get("quality", "best"),
         force=bool(p.get("force")),
         headers=p.get("headers") or {},
         timeout=float(p.get("timeout", 60.0)),
+        on_progress=on_progress,
+        on_phase=on_phase,
     ) as svc:
+        # quiet rich progress in daemon workers (progress goes to DB)
         results = svc.process_url(
             url,
             select_all=bool(p.get("select_all")),
@@ -123,6 +170,7 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
             if rec and rec.status == "completed" and rec.file_path:
                 enqueue_index_chain(queue, did)
 
+    _progress(queue, job, pct=100.0, message="done")
     return {
         "results": [
             {
@@ -151,8 +199,18 @@ def _run_scene(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
     download_id = int(job.payload.get("download_id") or job.download_id)
     reg = Registry(config.db_path)
     rec = _require_download(reg, download_id)
+    _progress(queue, job, pct=10.0, message="detecting scenes")
     scenes = detect_scenes(Path(rec.file_path))
+    _progress(
+        queue,
+        job,
+        pct=80.0,
+        message=f"saving {len(scenes)} scenes",
+        current=len(scenes),
+        total=len(scenes),
+    )
     ids = queue.replace_scenes(download_id, scenes)
+    _progress(queue, job, pct=100.0, message=f"{len(ids)} scenes", current=len(ids), total=len(ids))
     return {"download_id": download_id, "scene_count": len(ids), "scene_ids": ids}
 
 
@@ -167,12 +225,20 @@ def _run_clip(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
     work = config.keyframes_dir / f"dl_{download_id}"
     work.mkdir(parents=True, exist_ok=True)
     store = VectorStore(config.chroma_dir)
-    # clear previous embeddings for re-run of clip stage (text re-added later)
     queue.clear_embeddings(download_id)
     store.delete_for_download(download_id)
 
+    n = len(scenes)
     keys = []
-    for s in scenes:
+    for i, s in enumerate(scenes):
+        _progress(
+            queue,
+            job,
+            pct=100.0 * i / n if n else 0.0,
+            message=f"CLIP scene {i + 1}/{n}",
+            current=i,
+            total=n,
+        )
         result = select_keyframe_for_scene(
             Path(rec.file_path),
             s["start_sec"],
@@ -218,6 +284,7 @@ def _run_clip(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
                 "chroma_id": cid,
             }
         )
+    _progress(queue, job, pct=100.0, message=f"CLIP {n}/{n}", current=n, total=n)
     return {"download_id": download_id, "keyframes": keys}
 
 
@@ -230,8 +297,17 @@ def _run_embed(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
         raise RuntimeError("no scenes; run scene_detect first")
 
     store = VectorStore(config.chroma_dir)
+    n = len(scenes)
     items = []
-    for s in scenes:
+    for i, s in enumerate(scenes):
+        _progress(
+            queue,
+            job,
+            pct=100.0 * i / n if n else 0.0,
+            message=f"embed scene {i + 1}/{n}",
+            current=i,
+            total=n,
+        )
         emb, doc, model = embed_scene_text(
             title=rec.title,
             url=rec.url,
@@ -263,4 +339,5 @@ def _run_embed(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
             dim=len(emb),
         )
         items.append({"scene_id": s["id"], "chroma_id": cid, "model": model})
+    _progress(queue, job, pct=100.0, message=f"embed {n}/{n}", current=n, total=n)
     return {"download_id": download_id, "embeddings": items}

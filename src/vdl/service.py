@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from rich.console import Console
@@ -12,7 +12,7 @@ from rich.table import Table
 
 from vdl.classifier import ClassifiedResource, ResourceKind, ResourceProbe
 from vdl.config import Config
-from vdl.downloader import download_file
+from vdl.downloader import ProgressCallback, download_file
 from vdl.m3u8_dl import (
     UnsupportedIndexError,
     download_m3u8_ffmpeg,
@@ -51,6 +51,8 @@ class DownloadService:
         force: bool = False,
         headers: dict[str, str] | None = None,
         timeout: float = 60.0,
+        on_progress: ProgressCallback | None = None,
+        on_phase: Callable[[str, float | None], None] | None = None,
     ) -> None:
         self.config = config or Config()
         self.config.ensure_dirs()
@@ -59,11 +61,19 @@ class DownloadService:
         self.force = force
         self.headers = headers or {}
         self.timeout = timeout
+        # on_progress(written, total) for direct file downloads
+        self.on_progress = on_progress
+        # on_phase(message, pct_or_None) for multi-step downloads (probe, hls, …)
+        self.on_phase = on_phase
         self.client = httpx.Client(
             follow_redirects=True,
             timeout=timeout,
             headers={"User-Agent": "Mozilla/5.0 (compatible; vdl/0.1)"},
         )
+
+    def _phase(self, message: str, pct: float | None = None) -> None:
+        if self.on_phase:
+            self.on_phase(message, pct)
 
     def close(self) -> None:
         self.client.close()
@@ -88,6 +98,7 @@ class DownloadService:
         auto_yes: bool = False,
     ) -> list[ActionResult]:
         url = url.strip()
+        self._phase("classifying", 1.0)
 
         # Local filesystem path / file:// (PR1)
         local = resolve_local_path(url)
@@ -278,13 +289,25 @@ class DownloadService:
             title=res.filename_hint or filename_from_url(target),
         )
         try:
+            self._phase("downloading", 5.0)
+
+            def _dl_prog(written: int, total: int | None) -> None:
+                if self.on_progress:
+                    self.on_progress(written, total)
+                if total and total > 0 and self.on_phase:
+                    # map byte progress into 5–95%
+                    pct = 5.0 + 90.0 * min(1.0, written / total)
+                    self.on_phase(f"downloading {written}/{total} B", pct)
+
             path, size, digest = download_file(
                 self.client,
                 target,
                 self.config.download_dir,
                 filename=res.filename_hint,
                 headers=self.headers or None,
+                on_progress=_dl_prog,
             )
+            self._phase("finalizing", 97.0)
             rec = self.registry.mark_completed(
                 rec.id,
                 file_path=str(path),
@@ -292,6 +315,7 @@ class DownloadService:
                 file_hash=digest,
                 content_type=res.content_type,
             )
+            self._phase("done", 100.0)
             console.print(f"[green]完了[/green] {path} ({size:,} bytes)")
             return ActionResult(
                 status="downloaded",
@@ -325,6 +349,7 @@ class DownloadService:
             return ActionResult(status="failed", message=msg)
 
         try:
+            self._phase("parsing m3u8", 5.0)
             info = parse_m3u8(
                 self.client,
                 target,
@@ -396,6 +421,8 @@ class DownloadService:
             },
         )
         try:
+            segs = info.segment_count or "?"
+            self._phase(f"hls download (~{segs} segs)", 15.0)
             console.print(
                 f"[cyan]HLS ダウンロード中[/cyan] segments≈{info.segment_count} "
                 f"duration≈{info.duration_approx or '?'}s"
@@ -406,6 +433,7 @@ class DownloadService:
                 filename=title if title.endswith(".mp4") else title + ".mp4",
                 headers=self.headers or None,
             )
+            self._phase("hashing", 95.0)
             digest = sha256_file(path)
             rec = self.registry.mark_completed(
                 rec.id,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +17,11 @@ from vdl.index.scene import extract_frame
 
 
 _clip_bundle: dict[str, Any] | None = None
+_clip_lock = threading.Lock()
 
 
 def _load_clip() -> tuple[Any, Any, Any, str]:
-    """Return (model, preprocess, tokenizer, device). Cached."""
+    """Return (model, preprocess, tokenizer, device). Cached (thread-safe)."""
     global _clip_bundle
     if _clip_bundle is not None:
         return (
@@ -28,22 +30,30 @@ def _load_clip() -> tuple[Any, Any, Any, str]:
             _clip_bundle["tokenizer"],
             _clip_bundle["device"],
         )
-    import open_clip
-    import torch
+    with _clip_lock:
+        if _clip_bundle is not None:
+            return (
+                _clip_bundle["model"],
+                _clip_bundle["preprocess"],
+                _clip_bundle["tokenizer"],
+                _clip_bundle["device"],
+            )
+        import open_clip
+        import torch
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        CLIP_MODEL, pretrained=CLIP_PRETRAINED
-    )
-    tokenizer = open_clip.get_tokenizer(CLIP_MODEL)
-    model = model.to(device).eval()
-    _clip_bundle = {
-        "model": model,
-        "preprocess": preprocess,
-        "tokenizer": tokenizer,
-        "device": device,
-    }
-    return model, preprocess, tokenizer, device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            CLIP_MODEL, pretrained=CLIP_PRETRAINED
+        )
+        tokenizer = open_clip.get_tokenizer(CLIP_MODEL)
+        model = model.to(device).eval()
+        _clip_bundle = {
+            "model": model,
+            "preprocess": preprocess,
+            "tokenizer": tokenizer,
+            "device": device,
+        }
+        return model, preprocess, tokenizer, device
 
 
 def embed_image_paths(paths: list[Path]) -> np.ndarray:
@@ -57,7 +67,8 @@ def embed_image_paths(paths: list[Path]) -> np.ndarray:
         img = Image.open(p).convert("RGB")
         tensors.append(preprocess(img))
     batch = torch.stack(tensors).to(device)
-    with torch.no_grad():
+    # Serialize inference; concurrent CUDA/CLIP calls are fragile.
+    with _clip_lock, torch.no_grad():
         feats = model.encode_image(batch)
         feats = feats / feats.norm(dim=-1, keepdim=True)
     return feats.detach().cpu().numpy()

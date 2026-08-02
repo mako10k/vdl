@@ -31,6 +31,8 @@ OLLAMA_EMBED_MODEL = os.environ.get("VDL_OLLAMA_EMBED_MODEL", "nomic-embed-text"
 FRAMES_PER_SCENE = int(os.environ.get("VDL_FRAMES_PER_SCENE", "5"))
 # Background daemon exits after this many idle seconds with empty queue (0 = never).
 DAEMON_IDLE_SEC = float(os.environ.get("VDL_DAEMON_IDLE_SEC", "60"))
+# Max concurrent jobs in the daemon worker pool.
+DAEMON_WORKERS = int(os.environ.get("VDL_DAEMON_WORKERS", "3"))
 
 
 class Config:
@@ -44,6 +46,7 @@ class Config:
         self.daemon_pid_path = self.home / DAEMON_PID_NAME
         self.daemon_log_path = self.home / DAEMON_LOG_NAME
         self.daemon_idle_sec = DAEMON_IDLE_SEC
+        self.daemon_workers = max(1, DAEMON_WORKERS)
 
     def ensure_dirs(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)

@@ -30,10 +30,12 @@ def download_file(
     headers: dict[str, str] | None = None,
     timeout: float = 120.0,
     show_progress: bool = True,
+    on_progress: ProgressCallback | None = None,
 ) -> tuple[Path, int, str]:
     """
     Stream-download a URL to dest_dir.
     Returns (path, size_bytes, sha256).
+    on_progress(written_bytes, total_or_None) is called periodically.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     req_headers = {"User-Agent": "Mozilla/5.0 (compatible; vdl/0.1)"}
@@ -74,6 +76,17 @@ def download_file(
         total_n: int | None = int(total) if total and total.isdigit() else None
 
         written = 0
+        last_report = 0
+
+        def _report() -> None:
+            nonlocal last_report
+            if on_progress is None:
+                return
+            # throttle: every 256KB or at end
+            if written - last_report >= 256 * 1024 or (total_n and written >= total_n):
+                on_progress(written, total_n)
+                last_report = written
+
         if show_progress:
             with Progress(
                 TextColumn("[bold blue]{task.description}"),
@@ -90,6 +103,7 @@ def download_file(
                         f.write(chunk)
                         written += len(chunk)
                         progress.update(task, completed=written)
+                        _report()
         else:
             with open(out_path, "wb") as f:
                 for chunk in resp.iter_bytes(chunk_size=256 * 1024):
@@ -97,6 +111,9 @@ def download_file(
                         continue
                     f.write(chunk)
                     written += len(chunk)
+                    _report()
+        if on_progress:
+            on_progress(written, total_n)
 
     digest = sha256_file(out_path)
     return out_path, written, digest

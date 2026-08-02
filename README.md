@@ -41,8 +41,10 @@ ollama pull nomic-embed-text
 vdl get 'https://example.com/video.mp4'
 vdl get 'https://example.com/master.m3u8' -q best
 
-# キュー監視
+# キュー監視（progress / ETA 付き）
 vdl queue list
+vdl queue show 1
+vdl registry list   # index 進捗 % も表示
 vdl daemon status
 
 # レジストリ / 検索
@@ -51,15 +53,19 @@ vdl registry show 1
 vdl registry search '海辺のシーン'
 ```
 
-デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。
+デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。  
+実行可能なジョブは **最大 3 並列**（`VDL_DAEMON_WORKERS`）で処理します。優先度の高い download から claim されます。
 
 ```bash
 # アイドル秒数（0=自動終了しない）
 export VDL_DAEMON_IDLE_SEC=120
+# 並列ワーカー数
+export VDL_DAEMON_WORKERS=3
 
 # 自動起動したくないとき
 vdl get URL --no-daemon
 vdl daemon start   # 手動
+vdl daemon run --workers 3 --idle 60
 ```
 
 ### CLI マップ

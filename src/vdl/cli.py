@@ -191,10 +191,11 @@ def _auto_start_daemon(config: Config) -> None:
         console.print("[dim]`vdl daemon start` を手動で実行してください[/dim]")
         return
     idle = getattr(config, "daemon_idle_sec", 60)
+    workers = getattr(config, "daemon_workers", 3)
     if started:
         console.print(
             f"[cyan]daemon auto-started[/cyan] pid={pid} "
-            f"(idle exit after {idle:g}s empty queue)"
+            f"workers={workers} (idle exit after {idle:g}s empty queue)"
         )
     else:
         console.print(f"[dim]daemon running pid={pid}[/dim]")
@@ -241,6 +242,7 @@ def queue_list(ctx: click.Context, status: Optional[str], kind: Optional[str], l
     table.add_column("kind")
     table.add_column("pri", justify="right")
     table.add_column("status")
+    table.add_column("progress")
     table.add_column("dl_id", justify="right")
     table.add_column("dep", justify="right")
     table.add_column("updated")
@@ -257,6 +259,7 @@ def queue_list(ctx: click.Context, status: Optional[str], kind: Optional[str], l
             j.kind,
             str(j.priority),
             f"[{style}]{j.status}[/{style}]",
+            j.progress_label(),
             str(j.download_id or "-"),
             str(j.depends_on_job_id or "-"),
             j.updated_at[:19] if j.updated_at else "-",
@@ -277,8 +280,22 @@ def queue_show(ctx: click.Context, job_id: int) -> None:
     console.print(f"kind:     {job.kind}")
     console.print(f"priority: {job.priority}")
     console.print(f"status:   {job.status}")
+    console.print(f"progress: {job.progress_label()}")
+    if job.progress_msg:
+        console.print(f"  msg:    {job.progress_msg}")
+    if job.progress_current is not None:
+        console.print(
+            f"  count:  {job.progress_current}"
+            + (f"/{job.progress_total}" if job.progress_total else "")
+        )
+    if job.eta_sec is not None and job.status == "running":
+        from vdl.queue import format_duration
+
+        console.print(f"  eta:    {format_duration(job.eta_sec)}")
     console.print(f"download: {job.download_id}")
     console.print(f"depends:  {job.depends_on_job_id}")
+    console.print(f"started:  {job.started_at or '-'}")
+    console.print(f"updated:  {job.updated_at}")
     console.print(f"payload:  {job.payload}")
     console.print(f"result:   {job.result}")
     if job.error:
@@ -350,9 +367,19 @@ def daemon_group() -> None:
     default=None,
     help="キュー空のままこの秒数で自動終了 (0=無効)。未指定時: --pid なら設定値、否則は無効",
 )
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="並列ジョブ数 (default: VDL_DAEMON_WORKERS または 3)",
+)
 @click.pass_context
 def daemon_run(
-    ctx: click.Context, interval: float, write_pid: bool, idle_sec: float | None
+    ctx: click.Context,
+    interval: float,
+    write_pid: bool,
+    idle_sec: float | None,
+    workers: int | None,
 ) -> None:
     """フォアグラウンドでワーカーループを実行"""
     config: Config = ctx.obj["config"]
@@ -369,6 +396,7 @@ def daemon_run(
         foreground=True,
         write_pid_file=write_pid,
         idle_sec=effective_idle,
+        workers=workers,
     )
 
 
@@ -409,6 +437,7 @@ def daemon_status_cmd(ctx: click.Context) -> None:
     console.print(f"  pid_file: {st['pid_file']}")
     console.print(f"  log_file: {st['log_file']}")
     console.print(f"  idle_sec: {st.get('idle_sec', config.daemon_idle_sec)} (empty-queue auto-stop)")
+    console.print(f"  workers:  {st.get('workers', config.daemon_workers)} (max parallel jobs)")
     console.print(f"  queue:    {st['queue']}")
 
 
@@ -437,17 +466,31 @@ def registry_list(ctx: click.Context, status: Optional[str], limit: int) -> None
     if not rows:
         console.print("[dim]レコードがありません。[/dim]")
         return
+    q = JobQueue(config.db_path)
     table = Table(title=f"registry ({config.db_path})")
     table.add_column("ID", justify="right")
     table.add_column("状態")
     table.add_column("種別")
+    table.add_column("index")
     table.add_column("タイトル / URL")
     table.add_column("パス")
     for r in rows:
+        if r.status == "completed":
+            ix = q.index_status_for_download(r.id)
+            idx_label = (
+                f"{ix['overall_pct']:5.1f}% "
+                f"sc={ix['scenes']} clip={ix['clip_embeddings']} "
+                f"txt={ix['text_embeddings']}"
+            )
+            if ix["message"] and ix["message"] not in ("indexed", "not indexed"):
+                idx_label += f" ({ix['message']})"
+        else:
+            idx_label = "-"
         table.add_row(
             str(r.id),
             r.status,
             r.source_type,
+            idx_label,
             (r.title or "") + ("\n" if r.title else "") + r.url,
             r.file_path or "-",
         )
@@ -472,6 +515,13 @@ def registry_status(ctx: click.Context, url: str) -> None:
     scenes = q.list_scenes(rec.id)
     embs = q.list_embeddings(rec.id)
     console.print(f"  scenes: {len(scenes)}  embeddings: {len(embs)}")
+    if rec.status == "completed":
+        ix = q.index_status_for_download(rec.id)
+        console.print(
+            f"  index:  {ix['overall_pct']:.1f}% "
+            f"(scene={ix['scene_pct']:.0f}% clip={ix['clip_pct']:.0f}% "
+            f"embed={ix['embed_pct']:.0f}%) — {ix['message']}"
+        )
 
 
 @registry_group.command("show")
@@ -584,6 +634,7 @@ def info_cmd(ctx: click.Context) -> None:
     console.print(f"temp:       {config.temp_dir}")
     console.print(f"daemon:     {'running pid='+str(st['pid']) if st['running'] else 'stopped'}")
     console.print(f"idle_sec:   {config.daemon_idle_sec} (VDL_DAEMON_IDLE_SEC)")
+    console.print(f"workers:    {config.daemon_workers} (VDL_DAEMON_WORKERS)")
     console.print(f"queue:      {st['queue']}")
 
 
