@@ -23,6 +23,8 @@ web/dist/
 .llmthink/
 *.mpg
 *.mp4
-*.ts
+# MPEG-TS segments only (do not ignore TypeScript sources)
+downloads/**/*.ts
+**/*.mpegts
 *.webm
 *.mkv
