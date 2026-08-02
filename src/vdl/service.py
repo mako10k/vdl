@@ -490,6 +490,7 @@ class DownloadService:
     ) -> tuple[str, list[tuple[MediaCandidate, object | None]]]:
         """
         Fetch page and return (final_page_url, [(candidate, registry_record_or_None)]).
+        Recurses into iframes (HTML) to find nested media.
         """
         r = self.client.get(
             page_url,
@@ -498,7 +499,38 @@ class DownloadService:
         )
         r.raise_for_status()
         final = str(r.url)
-        candidates = extract_candidates(r.text, final)
+
+        def _fetch_iframe(u: str) -> str | None:
+            try:
+                ir = self.client.get(
+                    u,
+                    headers={**self.client.headers, **self.headers},
+                    timeout=min(self.timeout, 30.0),
+                    follow_redirects=True,
+                )
+                if ir.status_code >= 400:
+                    return None
+                ct = (ir.headers.get("content-type") or "").lower()
+                # only parse document-like responses as iframe HTML
+                if "html" not in ct and "xml" not in ct and not u.rstrip("/").endswith(
+                    (".html", ".htm", ".php", ".asp", ".aspx")
+                ):
+                    # might still be HTML without header
+                    if not ir.text.lstrip()[:100].lower().startswith(
+                        ("<!doctype", "<html", "<!--", "<head", "<body")
+                    ):
+                        return None
+                return ir.text
+            except Exception:
+                return None
+
+        candidates = extract_candidates(
+            r.text,
+            final,
+            fetch_html=_fetch_iframe,
+            iframe_depth=1,
+            max_iframes=8,
+        )
         rows: list[tuple[MediaCandidate, object | None]] = []
         for c in candidates:
             existing = self.registry.is_downloaded(normalize_url(c.url))

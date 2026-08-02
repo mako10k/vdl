@@ -1,30 +1,31 @@
-"""Extract video / stream candidates from HTML pages."""
+"""Extract video / HLS index candidates from HTML (strict ext/MIME; iframe recurse)."""
 
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
-from urllib.parse import urljoin, urlparse
+from typing import Callable, Optional
+from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from vdl.util import (
     INDEX_EXTENSIONS,
     VIDEO_EXTENSIONS,
-    is_index_extension,
-    is_video_extension,
     normalize_url,
     url_extension,
 )
+
+# Optional fetcher: url -> html text (or None on failure). Used for iframe recursion.
+FetchHtml = Callable[[str], Optional[str]]
 
 
 @dataclass
 class MediaCandidate:
     url: str
     kind: str  # "video" | "index"
-    source: str  # where found: video_tag, source_tag, anchor, meta, jsonld, script, iframe
+    source: str  # video_tag, source_tag, anchor, meta, jsonld, script, iframe, …
     title: str | None = None
     mime: str | None = None
     extras: dict = field(default_factory=dict)
@@ -34,40 +35,212 @@ class MediaCandidate:
         t = self.title or ""
         note = ""
         if self.kind == "index" and (
-            self.url.lower().endswith(".mpd") or ".mpd?" in self.url.lower()
+            ".mpd" in urlparse(self.url).path.lower()
         ):
             note = " [MPD=MVP非対応]"
         return f"[{self.kind}] {t + ' — ' if t else ''}{self.url}{note}  ({self.source})"
 
 
-# Patterns inside inline scripts / page text
+# HTML / document-like extensions — never treat as media
+_PAGE_EXTENSIONS = {
+    ".html",
+    ".htm",
+    ".xhtml",
+    ".php",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".cgi",
+    ".pl",
+    ".py",
+    ".rb",
+    ".do",
+    ".action",
+    ".cfm",
+    ".shtml",
+    ".css",
+    ".js",
+    ".mjs",
+    ".json",
+    ".xml",
+    ".svg",
+    ".txt",
+    ".pdf",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".gz",
+}
+
+_INDEX_MIME = {
+    "application/vnd.apple.mpegurl",
+    "application/x-mpegurl",
+    "audio/mpegurl",
+    "audio/x-mpegurl",
+    "application/mpegurl",
+    "application/dash+xml",
+}
+
+_VIDEO_MIME_PREFIXES = ("video/",)
+_VIDEO_MIME_EXACT = {
+    "application/mp4",
+    "application/x-matroska",
+}
+
+# Media file extensions we accept (path last segment only)
+_MEDIA_VIDEO_EXT = VIDEO_EXTENSIONS
+_MEDIA_INDEX_EXT = INDEX_EXTENSIONS
+
+# Strict media URL in text (extension must be path segment, not mid-host)
 _URL_RE = re.compile(
-    r"""(?P<url>https?://[^\s"'<>\\]+?\.(?:mp4|webm|mkv|mov|m4v|m3u8|mpd)(?:\?[^\s"'<>\\]*)?)""",
+    r"""(?P<url>https?://[^\s"'<>\\]+?\.(?:mp4|webm|mkv|mov|m4v|m3u8|m3u|mpd|ts|mpg|mpeg|avi|flv|wmv|3gp|ogv)(?:\?[^\s"'<>\\]*)?)""",
     re.I,
 )
 _REL_URL_RE = re.compile(
-    r"""(?P<url>(?:/|\./|\.\./)[^\s"'<>\\]+?\.(?:mp4|webm|mkv|mov|m4v|m3u8|mpd)(?:\?[^\s"'<>\\]*)?)""",
+    r"""(?P<url>(?:/|\./|\.\./)[^\s"'<>\\]+?\.(?:mp4|webm|mkv|mov|m4v|m3u8|m3u|mpd|ts|mpg|mpeg|avi|flv|wmv|3gp|ogv)(?:\?[^\s"'<>\\]*)?)""",
     re.I,
 )
 
+# JSON keys that often hold playback URLs
+_MEDIA_JSON_KEYS = {
+    "contenturl",
+    "video_url",
+    "videourl",
+    "stream_url",
+    "streamurl",
+    "hls",
+    "hlsurl",
+    "hls_url",
+    "m3u8",
+    "m3u8_url",
+    "dash",
+    "dash_url",
+    "playbackurl",
+    "playback_url",
+    "file",
+    "src",
+    "source",
+}
 
-def _kind_for_url(url: str) -> str | None:
-    if is_index_extension(url) or url_extension(url) in INDEX_EXTENSIONS:
+
+def _path_last_segment(url: str) -> str:
+    path = unquote(urlparse(url).path or "")
+    seg = path.rsplit("/", 1)[-1] if path else ""
+    return seg
+
+
+def _segment_extension(url: str) -> str:
+    """Extension of the last path segment only (ignores query)."""
+    seg = _path_last_segment(url)
+    if "." not in seg:
+        return ""
+    return "." + seg.rsplit(".", 1)[-1].lower()
+
+
+def _is_page_like_url(url: str) -> bool:
+    """True if URL looks like an HTML/document page, not a media file."""
+    ext = _segment_extension(url)
+    if ext in _PAGE_EXTENSIONS:
+        return True
+    # bare path ending with / or no extension — treat as page-like unless mime says otherwise
+    path = urlparse(url).path or ""
+    if path.endswith("/") or path == "":
+        return True
+    # common player/watch page patterns without media ext
+    if ext == "" and re.search(
+        r"/(watch|play|player|embed|video|v|clip|view)(/|$)",
+        path,
+        re.I,
+    ):
+        return True
+    return False
+
+
+def classify_media_url(
+    url: str,
+    *,
+    mime: str | None = None,
+) -> str | None:
+    """
+    Return 'video' | 'index' | None.
+    Prefer last-path-segment extension; MIME only for non-HTML types.
+    Never accepts text/html or page-like paths as media.
+    """
+    if not url or url.startswith(("data:", "javascript:", "blob:", "#")):
+        return None
+
+    mime_main = ""
+    if mime:
+        mime_main = mime.split(";", 1)[0].strip().lower()
+        if mime_main in {
+            "text/html",
+            "application/xhtml+xml",
+            "text/plain",
+            "text/css",
+            "application/javascript",
+            "text/javascript",
+            "application/json",
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+            "image/svg+xml",
+        }:
+            return None
+
+    ext = _segment_extension(url)
+    # Explicit media extensions win
+    if ext in _MEDIA_INDEX_EXT:
         return "index"
-    if is_video_extension(url) or url_extension(url) in VIDEO_EXTENSIONS:
+    if ext in _MEDIA_VIDEO_EXT:
         return "video"
-    # query-only m3u8 sometimes ends without clear ext in path — handled by regex groups
-    path = urlparse(url).path.lower()
-    if ".m3u8" in path or path.endswith(".m3u"):
+
+    # .m3u8 sometimes appears as .../index.m3u8/extra — rare; check path contains
+    path_l = (urlparse(url).path or "").lower()
+    if path_l.endswith(".m3u8") or path_l.endswith(".m3u") or path_l.endswith(".mpd"):
         return "index"
-    if any(path.endswith(e) or f"{e}?" in path for e in VIDEO_EXTENSIONS):
-        return "video"
+
+    # MIME without extension (blob CDN) — only strong types
+    if mime_main:
+        if mime_main in _INDEX_MIME or "mpegurl" in mime_main:
+            # still reject if clearly a page path with html-like name
+            if ext in _PAGE_EXTENSIONS:
+                return None
+            return "index"
+        if mime_main.startswith(_VIDEO_MIME_PREFIXES) or mime_main in _VIDEO_MIME_EXACT:
+            if ext in _PAGE_EXTENSIONS:
+                return None
+            return "video"
+
+    # No extension + no strong mime → not a media candidate
+    # (prevents HTML player / "index" pages from being listed)
+    if _is_page_like_url(url) or ext in _PAGE_EXTENSIONS or ext == "":
+        return None
+
     return None
+
+
+def _kind_for_url(url: str, mime: str | None = None) -> str | None:
+    return classify_media_url(url, mime=mime)
+
+
+def _clean_url(raw: str, base: str) -> str | None:
+    if not raw or not isinstance(raw, str):
+        return None
+    raw = raw.strip().strip("'\"")
+    if not raw or raw.startswith(("data:", "javascript:", "blob:", "#")):
+        return None
+    abs_url = urljoin(base, raw)
+    abs_url = abs_url.rstrip("\\).,;'\"")
+    # drop pure fragments
+    if abs_url.startswith("#"):
+        return None
+    return abs_url
 
 
 def _add(
     found: dict[str, MediaCandidate],
-    raw_url: str,
+    raw_url: str | None,
     base: str,
     *,
     source: str,
@@ -75,27 +248,21 @@ def _add(
     mime: str | None = None,
     extras: dict | None = None,
 ) -> None:
-    if not raw_url or raw_url.startswith("data:"):
+    if not raw_url:
         return
-    abs_url = urljoin(base, raw_url.strip().strip("'\""))
-    # strip trailing punctuation from regex captures
-    abs_url = abs_url.rstrip("\\).,;'\"")
-    kind = _kind_for_url(abs_url)
-    if kind is None:
-        # mime hint
-        if mime:
-            m = mime.lower()
-            if "mpegurl" in m or m == "application/dash+xml":
-                kind = "index"
-            elif m.startswith("video/"):
-                kind = "video"
+    abs_url = _clean_url(raw_url, base)
+    if not abs_url:
+        return
+    kind = classify_media_url(abs_url, mime=mime)
     if kind is None:
         return
     key = normalize_url(abs_url)
     if key in found:
-        # enrich title if missing
         if title and not found[key].title:
             found[key].title = title
+        if mime and not found[key].mime:
+            found[key].mime = mime
+        # prefer more specific source tags over page_text
         return
     found[key] = MediaCandidate(
         url=abs_url,
@@ -109,54 +276,51 @@ def _add(
 
 def _walk_json(obj: object, base: str, found: dict[str, MediaCandidate], source: str) -> None:
     if isinstance(obj, dict):
-        # common keys
+        title = obj.get("name") if isinstance(obj.get("name"), str) else None
         for k, v in obj.items():
-            lk = str(k).lower()
-            if isinstance(v, str) and lk in {
-                "contenturl",
-                "url",
-                "src",
-                "file",
-                "video_url",
-                "videourl",
-                "stream",
-                "stream_url",
-                "hls",
-                "hlsurl",
-                "playlist",
-                "source",
-                "playbackurl",
-            }:
-                _add(found, v, base, source=source, title=obj.get("name") if isinstance(obj.get("name"), str) else None)
-            elif isinstance(v, str) and (_kind_for_url(v) or any(ext in v.lower() for ext in (".m3u8", ".mp4", ".webm"))):
-                _add(found, v, base, source=source)
+            lk = str(k).lower().replace("-", "_")
+            if isinstance(v, str):
+                if lk in _MEDIA_JSON_KEYS or lk.endswith("_url") or lk.endswith("url"):
+                    # Only add if it classifies as media (strict)
+                    if classify_media_url(v) or classify_media_url(urljoin(base, v)):
+                        _add(found, v, base, source=source, title=title)
+                elif classify_media_url(v):
+                    _add(found, v, base, source=source, title=title)
+                else:
+                    # still recurse into nested? skip string
+                    pass
             else:
                 _walk_json(v, base, found, source)
     elif isinstance(obj, list):
         for item in obj:
             _walk_json(item, base, found, source)
     elif isinstance(obj, str):
-        if _kind_for_url(obj) or any(ext in obj.lower() for ext in (".m3u8", ".mp4")):
+        if classify_media_url(obj):
             _add(found, obj, base, source=source)
 
 
-def extract_candidates(html: str, page_url: str) -> list[MediaCandidate]:
-    """Parse HTML and return unique media candidates."""
-    found: dict[str, MediaCandidate] = {}
-    soup = BeautifulSoup(html, "lxml")
+def _extract_from_soup(
+    soup: BeautifulSoup,
+    page_url: str,
+    found: dict[str, MediaCandidate],
+    *,
+    page_title: str | None,
+    source_prefix: str = "",
+) -> list[str]:
+    """
+    Fill `found` from one document. Returns absolute iframe src URLs that look
+    like embed pages (not direct media) for optional recursion.
+    """
+    pref = f"{source_prefix}:" if source_prefix else ""
+    iframe_pages: list[str] = []
 
-    page_title = None
-    if soup.title and soup.title.string:
-        page_title = soup.title.string.strip()
-
-    # <video src> and nested <source>
     for video in soup.find_all("video"):
         if video.get("src"):
             _add(
                 found,
                 video["src"],
                 page_url,
-                source="video_tag",
+                source=f"{pref}video_tag",
                 title=video.get("title") or page_title,
             )
         for src in video.find_all("source"):
@@ -164,23 +328,27 @@ def extract_candidates(html: str, page_url: str) -> list[MediaCandidate]:
                 found,
                 src.get("src"),
                 page_url,
-                source="source_tag",
+                source=f"{pref}source_tag",
                 title=video.get("title") or page_title,
                 mime=src.get("type"),
             )
 
-    # bare <source>
     for src in soup.find_all("source"):
-        _add(found, src.get("src"), page_url, source="source_tag", mime=src.get("type"))
+        _add(
+            found,
+            src.get("src"),
+            page_url,
+            source=f"{pref}source_tag",
+            mime=src.get("type"),
+        )
 
-    # anchors to media files
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if _kind_for_url(urljoin(page_url, href)):
+        abs_u = urljoin(page_url, href)
+        if classify_media_url(abs_u):
             text = a.get_text(strip=True) or a.get("title")
-            _add(found, href, page_url, source="anchor", title=text or page_title)
+            _add(found, href, page_url, source=f"{pref}anchor", title=text or page_title)
 
-    # og:video / twitter:player etc.
     for prop in (
         "og:video",
         "og:video:url",
@@ -189,46 +357,139 @@ def extract_candidates(html: str, page_url: str) -> list[MediaCandidate]:
     ):
         tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
         if tag and tag.get("content"):
-            _add(found, tag["content"], page_url, source="meta", title=page_title)
+            # og:video:type if present
+            mime = None
+            if prop.startswith("og:video"):
+                ttag = soup.find("meta", property="og:video:type")
+                if ttag and ttag.get("content"):
+                    mime = ttag["content"]
+            content = tag["content"]
+            # Only accept if media (skip HTML player landing pages in og:video)
+            if classify_media_url(content, mime=mime):
+                _add(
+                    found,
+                    content,
+                    page_url,
+                    source=f"{pref}meta",
+                    title=page_title,
+                    mime=mime,
+                )
 
-    # JSON-LD
-    for script in soup.find_all("script", type=lambda t: t and "ld+json" in t):
+    for script in soup.find_all("script", type=lambda t: t and "ld+json" in str(t)):
         raw = script.string or script.get_text() or ""
         try:
             data = json.loads(raw)
-            _walk_json(data, page_url, found, "jsonld")
+            _walk_json(data, page_url, found, f"{pref}jsonld")
         except json.JSONDecodeError:
             for m in _URL_RE.finditer(raw):
-                _add(found, m.group("url"), page_url, source="jsonld")
+                _add(found, m.group("url"), page_url, source=f"{pref}jsonld")
 
-    # iframe src (sometimes embed pages — keep as candidate only if media ext)
+    # iframe: collect media directly; queue HTML-like for recursion
     for iframe in soup.find_all("iframe", src=True):
         src = iframe["src"]
-        if _kind_for_url(urljoin(page_url, src)):
-            _add(found, src, page_url, source="iframe", title=page_title)
+        abs_src = urljoin(page_url, src)
+        if classify_media_url(abs_src):
+            _add(found, src, page_url, source=f"{pref}iframe", title=page_title)
+        else:
+            # skip about:blank, javascript
+            if abs_src.startswith(("http://", "https://", "/")):
+                iframe_pages.append(abs_src)
 
-    # inline scripts: absolute + relative media URLs
+    # also <embed src> / <object data>
+    for emb in soup.find_all("embed", src=True):
+        _add(found, emb["src"], page_url, source=f"{pref}embed", title=page_title)
+    for obj in soup.find_all("object", data=True):
+        _add(found, obj["data"], page_url, source=f"{pref}object", title=page_title)
+
     for script in soup.find_all("script"):
         raw = script.string or script.get_text() or ""
         if not raw or len(raw) > 2_000_000:
             continue
         for m in _URL_RE.finditer(raw):
-            _add(found, m.group("url"), page_url, source="script", title=page_title)
+            _add(found, m.group("url"), page_url, source=f"{pref}script", title=page_title)
         for m in _REL_URL_RE.finditer(raw):
-            _add(found, m.group("url"), page_url, source="script", title=page_title)
-        # try JSON blobs in script
+            _add(found, m.group("url"), page_url, source=f"{pref}script", title=page_title)
         for jm in re.finditer(r"\{[^{}]{20,}\}", raw):
             try:
                 data = json.loads(jm.group(0))
-                _walk_json(data, page_url, found, "script_json")
+                _walk_json(data, page_url, found, f"{pref}script_json")
             except json.JSONDecodeError:
                 pass
 
-    # full-page URL scrape as last pass (og etc. already covered)
+    return iframe_pages
+
+
+def extract_candidates(
+    html: str,
+    page_url: str,
+    *,
+    fetch_html: FetchHtml | None = None,
+    iframe_depth: int = 1,
+    max_iframes: int = 8,
+) -> list[MediaCandidate]:
+    """
+    Parse HTML and return unique media candidates (video file or stream index).
+
+    - Only URLs with media extensions (last path segment) or strong media MIME
+    - HTML/player pages are not listed as candidates
+    - iframes: if src is media → candidate; else fetch HTML (when fetch_html
+      provided) and recurse up to iframe_depth
+    """
+    found: dict[str, MediaCandidate] = {}
+    soup = BeautifulSoup(html, "lxml")
+    page_title = None
+    if soup.title and soup.title.string:
+        page_title = soup.title.string.strip()
+
+    iframe_pages = _extract_from_soup(
+        soup, page_url, found, page_title=page_title, source_prefix=""
+    )
+
+    # Strict media URLs anywhere in page text (extension-gated regex)
     for m in _URL_RE.finditer(html):
         _add(found, m.group("url"), page_url, source="page_text", title=page_title)
 
-    # Prefer video/index over noise: sort index first then video, stable by url
+    # iframe recursion
+    if fetch_html and iframe_depth > 0 and iframe_pages:
+        seen_frames: set[str] = set()
+        for i, frame_url in enumerate(iframe_pages):
+            if i >= max_iframes:
+                break
+            key = normalize_url(frame_url)
+            if key in seen_frames:
+                continue
+            seen_frames.add(key)
+            # skip if already have as media
+            if key in found:
+                continue
+            try:
+                sub_html = fetch_html(frame_url)
+            except Exception:
+                sub_html = None
+            if not sub_html:
+                continue
+            # recurse with reduced depth; prefix source
+            nested = extract_candidates(
+                sub_html,
+                frame_url,
+                fetch_html=fetch_html if iframe_depth > 1 else None,
+                iframe_depth=iframe_depth - 1,
+                max_iframes=max_iframes,
+            )
+            for c in nested:
+                k = normalize_url(c.url)
+                if k not in found:
+                    # mark provenance via iframe
+                    found[k] = MediaCandidate(
+                        url=c.url,
+                        kind=c.kind,
+                        source=f"iframe>{c.source}",
+                        title=c.title or page_title,
+                        mime=c.mime,
+                        extras={**c.extras, "iframe_src": frame_url},
+                    )
+
     items = list(found.values())
+    # index first, then video; stable by url
     items.sort(key=lambda c: (0 if c.kind == "index" else 1, c.url))
     return items
