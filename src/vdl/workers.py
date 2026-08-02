@@ -19,6 +19,13 @@ from vdl.registry import Registry
 from vdl.service import DownloadService
 from vdl.vectorstore import VectorStore
 
+class DaemonReloadRequested(Exception):
+    """Raised by daemon_reload job so the main loop can mark done + re-exec."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("daemon reload requested")
+        self.result = result
+
 
 def enqueue_download(
     queue: JobQueue,
@@ -92,7 +99,26 @@ def run_job(config: Config, job: Job) -> dict[str, Any]:
         return _run_clip(config, queue, job)
     if job.kind == JobKind.EMBED.value:
         return _run_embed(config, queue, job)
+    if job.kind == JobKind.DAEMON_RELOAD.value:
+        return _run_daemon_reload(config, queue, job)
     raise ValueError(f"unknown job kind: {job.kind}")
+
+
+def _run_daemon_reload(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
+    """
+    Prepare self-update. Raises DaemonReloadRequested so the main daemon
+    thread marks the job done and re-execs (must not run under other workers).
+    """
+    _progress(queue, job, pct=20.0, message="self-update gate")
+    payload = job.payload
+    _progress(queue, job, pct=80.0, message="re-exec pending")
+    raise DaemonReloadRequested(
+        {
+            "action": "reexec",
+            "reason": payload.get("reason"),
+            "fingerprint": payload.get("fingerprint"),
+        }
+    )
 
 
 def _progress(

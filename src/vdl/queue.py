@@ -17,6 +17,8 @@ class JobKind(str, Enum):
     SCENE_DETECT = "scene_detect"
     CLIP_OPTIMIZE = "clip_optimize"
     EMBED = "embed"
+    # Implicit gate: all other work waits on this; daemon re-execs to load new code.
+    DAEMON_RELOAD = "daemon_reload"
 
 
 class JobStatus(str, Enum):
@@ -72,6 +74,13 @@ class Job:
 
     def progress_label(self, *, bar_width: int = 10) -> str:
         """Human-readable progress for list views."""
+        if self.kind == JobKind.DAEMON_RELOAD.value:
+            if self.status == "pending":
+                return "⚡ self-update gate (blocks all)"
+            if self.status == "running":
+                return "⚡ reloading daemon…"
+            if self.status == "done":
+                return "self-update done"
         if self.status == "pending":
             return "queued"
         if self.status == "cancelled":
@@ -320,29 +329,152 @@ class JobQueue:
             ).fetchall()
             return [self._row(r) for r in rows]
 
+    def find_active_reload(self) -> Optional[Job]:
+        """Pending or running daemon_reload job (newest)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE kind = ?
+                  AND status IN ('pending', 'running')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (JobKind.DAEMON_RELOAD.value,),
+            ).fetchone()
+            return self._row(row) if row else None
+
+    def reclaim_stale_running(self) -> int:
+        """
+        After daemon crash/re-exec, mark orphaned running jobs as pending again
+        (except daemon_reload, which is re-enqueued as pending too).
+        """
+        now = _utc_now()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs SET
+                    status = 'pending',
+                    started_at = NULL,
+                    finished_at = NULL,
+                    progress_pct = 0,
+                    progress_msg = 'reclaimed after daemon restart',
+                    eta_sec = NULL,
+                    updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            return int(cur.rowcount or 0)
+
+    def ensure_daemon_reload_gate(
+        self,
+        *,
+        reason: str,
+        fingerprint: str,
+        priority: int = 10_000,
+    ) -> Job:
+        """
+        Ensure a daemon_reload job exists. Other pending root jobs get
+        depends_on_job_id → reload so the gate is visible in the queue.
+        """
+        existing = self.find_active_reload()
+        if existing:
+            return existing
+
+        job = self.enqueue(
+            JobKind.DAEMON_RELOAD,
+            priority=priority,
+            payload={
+                "reason": reason,
+                "fingerprint": fingerprint,
+                "implicit_gate": True,
+            },
+        )
+        # Attach all currently claimable pending roots to the reload gate.
+        now = _utc_now()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET
+                    depends_on_job_id = ?,
+                    updated_at = ?
+                WHERE status = 'pending'
+                  AND id != ?
+                  AND kind != ?
+                  AND (
+                    depends_on_job_id IS NULL
+                    OR EXISTS (
+                      SELECT 1 FROM jobs d
+                      WHERE d.id = jobs.depends_on_job_id
+                        AND d.status IN ('done', 'failed', 'cancelled')
+                    )
+                  )
+                """,
+                (job.id, now, job.id, JobKind.DAEMON_RELOAD.value),
+            )
+        return self.get(job.id) or job
+
     def claim_next(self) -> Optional[Job]:
         """
         Atomically claim highest-priority runnable job.
         Runnable = pending AND (no dependency OR dependency is done).
+
+        If a daemon_reload gate is active (pending/running), only that job
+        may be claimed — all other work is blocked (implicit global dependency).
         """
         now = _utc_now()
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
+
+            gate = conn.execute(
                 """
-                SELECT j.* FROM jobs j
-                WHERE j.status = 'pending'
-                  AND (
-                    j.depends_on_job_id IS NULL
-                    OR EXISTS (
-                      SELECT 1 FROM jobs d
-                      WHERE d.id = j.depends_on_job_id AND d.status = 'done'
-                    )
-                  )
-                ORDER BY j.priority DESC, j.id ASC
+                SELECT * FROM jobs
+                WHERE kind = ?
+                  AND status IN ('pending', 'running')
+                ORDER BY id DESC
                 LIMIT 1
-                """
+                """,
+                (JobKind.DAEMON_RELOAD.value,),
             ).fetchone()
+
+            if gate is not None:
+                if gate["status"] == "running":
+                    # Reload already in progress — do not claim anything else.
+                    return None
+                # Only claim the reload gate (must be runnable).
+                row = conn.execute(
+                    """
+                    SELECT j.* FROM jobs j
+                    WHERE j.id = ?
+                      AND j.status = 'pending'
+                      AND (
+                        j.depends_on_job_id IS NULL
+                        OR EXISTS (
+                          SELECT 1 FROM jobs d
+                          WHERE d.id = j.depends_on_job_id AND d.status = 'done'
+                        )
+                      )
+                    """,
+                    (gate["id"],),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT j.* FROM jobs j
+                    WHERE j.status = 'pending'
+                      AND (
+                        j.depends_on_job_id IS NULL
+                        OR EXISTS (
+                          SELECT 1 FROM jobs d
+                          WHERE d.id = j.depends_on_job_id AND d.status = 'done'
+                        )
+                      )
+                    ORDER BY j.priority DESC, j.id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+
             if not row:
                 return None
             conn.execute(

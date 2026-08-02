@@ -1,4 +1,4 @@
-"""Background worker: download-first queue, parallel jobs, auto-start, idle stop."""
+"""Background worker: download-first queue, parallel jobs, auto-start, idle stop, self-reload."""
 
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from vdl.config import DAEMON_IDLE_SEC, DAEMON_WORKERS, Config
-from vdl.queue import Job, JobQueue
-from vdl.workers import run_job
+from vdl.queue import Job, JobKind, JobQueue
+from vdl.reload import ensure_reload_if_stale, package_fingerprint, reexec_daemon
+from vdl.workers import DaemonReloadRequested, run_job
 
 
 class DaemonState:
@@ -71,6 +72,7 @@ def daemon_status(config: Config) -> dict:
     pid = read_pid(config.daemon_pid_path)
     running = bool(pid and pid_is_running(pid))
     q = JobQueue(config.db_path)
+    reload = q.find_active_reload()
     return {
         "running": running,
         "pid": pid if running else None,
@@ -79,6 +81,9 @@ def daemon_status(config: Config) -> dict:
         "queue": q.counts(),
         "idle_sec": getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC),
         "workers": getattr(config, "daemon_workers", DAEMON_WORKERS),
+        "auto_reload": getattr(config, "daemon_auto_reload", True),
+        "reload_job_id": reload.id if reload else None,
+        "code_fingerprint": package_fingerprint(),
     }
 
 
@@ -88,19 +93,22 @@ def _queue_is_idle(queue: JobQueue) -> bool:
     return counts.get("pending", 0) == 0 and counts.get("running", 0) == 0
 
 
-def _execute_job(config: Config, job: Job) -> tuple[int, str, str | None]:
+def _execute_job(config: Config, job: Job) -> tuple[int, str, str | None, dict | None]:
     """
-    Run one job in a worker thread. Each thread uses its own JobQueue connection.
-    Returns (job_id, status, error_or_none).
+    Run one job in a worker thread.
+    Returns (job_id, status, error_or_none, result_or_none).
     """
     queue = JobQueue(config.db_path)
     try:
         result = run_job(config, job)
         queue.mark_done(job.id, result)
-        return job.id, "done", None
+        return job.id, "done", None, result
+    except DaemonReloadRequested as e:
+        # Should only happen on main thread; treat as special.
+        return job.id, "reload", None, e.result
     except Exception as e:
         queue.mark_failed(job.id, str(e))
-        return job.id, "failed", str(e)
+        return job.id, "failed", str(e), None
 
 
 def run_forever(
@@ -114,13 +122,15 @@ def run_forever(
 ) -> None:
     """
     Worker loop with a thread pool.
-    Claims up to `workers` runnable jobs in parallel (default 3).
-    Priority ordering is preserved by claim_next (highest priority first).
+    At job boundaries (no in-flight work), may enqueue a daemon_reload gate
+    if package code changed, then re-exec when that job is claimed.
     """
     config.ensure_dirs()
     if idle_sec is None:
         idle_sec = float(getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC))
-    max_workers = int(workers if workers is not None else getattr(config, "daemon_workers", DAEMON_WORKERS))
+    max_workers = int(
+        workers if workers is not None else getattr(config, "daemon_workers", DAEMON_WORKERS)
+    )
     max_workers = max(1, max_workers)
 
     logger = _setup_logging(
@@ -129,6 +139,13 @@ def run_forever(
     )
     state = DaemonState()
     queue = JobQueue(config.db_path)
+
+    # Recover jobs left "running" by previous process death / re-exec.
+    reclaimed = queue.reclaim_stale_running()
+    if reclaimed:
+        logger.info("reclaimed %s stale running job(s)", reclaimed)
+
+    started_fp = package_fingerprint()
 
     def _handle_sig(_signum: int, _frame: object) -> None:
         logger.info("stop requested")
@@ -141,24 +158,29 @@ def run_forever(
         write_pid(config.daemon_pid_path, os.getpid())
 
     logger.info(
-        "daemon started home=%s workers=%s idle_sec=%s",
+        "daemon started home=%s workers=%s idle_sec=%s fingerprint=%s auto_reload=%s",
         config.home,
         max_workers,
         idle_sec if idle_sec and idle_sec > 0 else "disabled",
+        started_fp,
+        getattr(config, "daemon_auto_reload", True),
     )
 
     idle_since: float | None = None
     futures: dict[Future[Any], Job] = {}
 
     def _drain_done() -> None:
-        nonlocal idle_since
         finished = [f for f in list(futures) if f.done()]
         for fut in finished:
             job = futures.pop(fut)
             try:
-                jid, status, err = fut.result()
+                jid, status, err, _result = fut.result()
                 if status == "done":
                     logger.info("job done id=%s kind=%s", jid, job.kind)
+                elif status == "reload":
+                    logger.warning(
+                        "reload raised from worker unexpectedly id=%s", jid
+                    )
                 else:
                     logger.error("job failed id=%s kind=%s: %s", jid, job.kind, err)
             except Exception as e:
@@ -168,6 +190,35 @@ def run_forever(
                 except Exception:
                     pass
 
+    def _maybe_schedule_reload() -> None:
+        """Only at true job boundary (no in-flight futures)."""
+        if futures:
+            return
+        ensure_reload_if_stale(
+            config, queue, started_fingerprint=started_fp, logger=logger
+        )
+
+    def _perform_reload(job: Job) -> None:
+        logger.info("executing daemon_reload id=%s — re-exec", job.id)
+        queue.update_progress(job.id, pct=50.0, message="re-exec")
+        try:
+            result = run_job(config, job)
+            # run_job raises DaemonReloadRequested
+            queue.mark_done(job.id, result)
+        except DaemonReloadRequested as e:
+            queue.mark_done(job.id, e.result)
+            logger.info(
+                "daemon_reload id=%s done; re-exec workers=%s idle=%s",
+                job.id,
+                max_workers,
+                idle_sec,
+            )
+            # PID file removed so child can write; child will re-write.
+            if write_pid_file:
+                remove_pid(config.daemon_pid_path)
+            reexec_daemon(config, idle_sec=float(idle_sec or 0), workers=max_workers)
+        # unreachable if exec succeeds
+
     try:
         with ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="vdl-job"
@@ -175,14 +226,43 @@ def run_forever(
             while not state.stopping:
                 _drain_done()
 
-                # Fill free slots with highest-priority claimable jobs
+                # Job boundary: consider self-update gate
+                if not futures:
+                    _maybe_schedule_reload()
+
+                # Fill free slots — but if reload is active, only claim that
+                # (and only when no other work is in-flight).
+                reload_gate = queue.find_active_reload()
+                if reload_gate and futures:
+                    # Wait for in-flight user jobs to finish before reload.
+                    wait(
+                        list(futures.keys()),
+                        timeout=poll_interval,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    continue
+
                 claimed_any = False
                 while len(futures) < max_workers and not state.stopping:
+                    # When reload pending, claim only after idle workers
+                    if reload_gate and futures:
+                        break
                     job = queue.claim_next()
                     if not job:
                         break
                     claimed_any = True
                     idle_since = None
+
+                    if job.kind == JobKind.DAEMON_RELOAD.value:
+                        # Main-thread only; drops parallelism to 0 for the gate.
+                        logger.info(
+                            "job start id=%s kind=daemon_reload (self-update gate)",
+                            job.id,
+                        )
+                        _perform_reload(job)
+                        # if reexec failed, continue loop
+                        break
+
                     logger.info(
                         "job start id=%s kind=%s priority=%s download_id=%s "
                         "(active=%s/%s)",
@@ -196,8 +276,13 @@ def run_forever(
                     fut = pool.submit(_execute_job, config, job)
                     futures[fut] = job
 
+                    # After claiming one, re-check reload gate (should not claim
+                    # more if a reload was just injected — only inject at boundary)
+                    reload_gate = queue.find_active_reload()
+                    if reload_gate:
+                        break
+
                 if futures:
-                    # Wait for at least one job to finish (or poll timeout)
                     wait(
                         list(futures.keys()),
                         timeout=poll_interval,
@@ -205,7 +290,6 @@ def run_forever(
                     )
                     continue
 
-                # No active work and nothing claimable
                 if claimed_any:
                     continue
 
@@ -226,7 +310,6 @@ def run_forever(
 
                 time.sleep(poll_interval)
 
-            # Graceful: finish in-flight jobs
             if futures:
                 logger.info(
                     "waiting for %s in-flight job(s) before stop", len(futures)

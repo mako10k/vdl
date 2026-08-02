@@ -112,6 +112,18 @@ def _watch_dashboard(
             ("stopped", "bold yellow"),
             ("  (will auto-start on get / reindex)", "dim"),
         )
+    if st.get("reload_job_id"):
+        reload_line = Text.assemble(
+            ("self-update gate ", "bold magenta"),
+            (f"job #{st['reload_job_id']}", "magenta"),
+            (" — all other jobs wait on this", "dim"),
+        )
+    else:
+        reload_line = Text(
+            f"auto_reload={'on' if st.get('auto_reload', True) else 'off'}  "
+            f"fp={st.get('code_fingerprint', '?')}",
+            style="dim",
+        )
 
     counts_parts = []
     for key in ("running", "pending", "done", "failed", "cancelled"):
@@ -124,6 +136,7 @@ def _watch_dashboard(
         Group(
             Text(f"vdl watch  ·  {now}", style="bold"),
             daemon_line,
+            reload_line,
             Text.from_markup(f"queue  {counts_line}"),
         ),
         border_style="blue",
@@ -343,7 +356,14 @@ def queue_group() -> None:
 @click.option(
     "--kind",
     type=click.Choice(
-        ["download", "scene_detect", "clip_optimize", "embed"], case_sensitive=False
+        [
+            "download",
+            "scene_detect",
+            "clip_optimize",
+            "embed",
+            "daemon_reload",
+        ],
+        case_sensitive=False,
     ),
     default=None,
 )
@@ -802,6 +822,10 @@ def info_cmd(ctx: click.Context) -> None:
     console.print(f"daemon:     {'running pid='+str(st['pid']) if st['running'] else 'stopped'}")
     console.print(f"idle_sec:   {config.daemon_idle_sec} (VDL_DAEMON_IDLE_SEC)")
     console.print(f"workers:    {config.daemon_workers} (VDL_DAEMON_WORKERS)")
+    console.print(f"auto_reload:{'on' if config.daemon_auto_reload else 'off'} (VDL_DAEMON_AUTO_RELOAD)")
+    if st.get("reload_job_id"):
+        console.print(f"reload_gate:job #{st['reload_job_id']}")
+    console.print(f"code_fp:    {st.get('code_fingerprint')}")
     console.print(f"queue:      {st['queue']}")
 
 

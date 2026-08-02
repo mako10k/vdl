@@ -21,6 +21,8 @@ PRIORITY_DOWNLOAD = 100
 PRIORITY_SCENE = 40
 PRIORITY_CLIP = 30
 PRIORITY_EMBED = 20
+# Higher than any user job — claimed first at job boundaries.
+PRIORITY_DAEMON_RELOAD = 10_000
 
 # Models / thresholds (env override)
 SCENE_THRESHOLD = float(os.environ.get("VDL_SCENE_THRESHOLD", "0.3"))
@@ -33,6 +35,13 @@ FRAMES_PER_SCENE = int(os.environ.get("VDL_FRAMES_PER_SCENE", "5"))
 DAEMON_IDLE_SEC = float(os.environ.get("VDL_DAEMON_IDLE_SEC", "60"))
 # Max concurrent jobs in the daemon worker pool.
 DAEMON_WORKERS = int(os.environ.get("VDL_DAEMON_WORKERS", "3"))
+# Auto-enqueue daemon_reload when package code mtime changes (job-boundary only).
+DAEMON_AUTO_RELOAD = os.environ.get("VDL_DAEMON_AUTO_RELOAD", "1").strip() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 class Config:
@@ -47,6 +56,7 @@ class Config:
         self.daemon_log_path = self.home / DAEMON_LOG_NAME
         self.daemon_idle_sec = DAEMON_IDLE_SEC
         self.daemon_workers = max(1, DAEMON_WORKERS)
+        self.daemon_auto_reload = DAEMON_AUTO_RELOAD
 
     def ensure_dirs(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)

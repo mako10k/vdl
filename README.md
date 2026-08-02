@@ -59,6 +59,15 @@ vdl registry search '海辺のシーン'
 デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。  
 実行可能なジョブは **最大 3 並列**（`VDL_DAEMON_WORKERS`）で処理します。優先度の高い download から claim されます。
 
+### 自己更新（`daemon_reload`）
+
+ジョブの切れ目（in-flight が 0 のとき）にパッケージコードの変更を検知すると、  
+キューに **`daemon_reload`（self-update gate）** が入ります。
+
+- 他の pending ルートジョブは **`depends_on = reload_job_id`** が付き、一覧上も依存が見える
+- ゲート実行中は並列度が落ち、reload のみ実行 → デーモンを **re-exec** して新コードを読み込み
+- 無効化: `export VDL_DAEMON_AUTO_RELOAD=0`
+
 ```bash
 # アイドル秒数（0=自動終了しない）
 export VDL_DAEMON_IDLE_SEC=120
