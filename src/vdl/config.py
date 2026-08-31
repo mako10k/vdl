@@ -20,6 +20,9 @@ SUPERVISOR_LOG_NAME = "supervisor.log"
 
 # Job priorities (higher first)
 PRIORITY_DOWNLOAD = 100
+# After download, before index: remux leftover MPEG-TS, then collapse dupes.
+PRIORITY_TS_TO_MP4 = 50
+PRIORITY_DEDUP = 45
 PRIORITY_SCENE = 40
 PRIORITY_CLIP = 30
 PRIORITY_EMBED = 20
@@ -32,6 +35,18 @@ CLIP_MODEL = os.environ.get("VDL_CLIP_MODEL", "ViT-B-32")
 CLIP_PRETRAINED = os.environ.get("VDL_CLIP_PRETRAINED", "openai")
 OLLAMA_BASE = os.environ.get("VDL_OLLAMA_BASE", "http://127.0.0.1:11434")
 OLLAMA_EMBED_MODEL = os.environ.get("VDL_OLLAMA_EMBED_MODEL", "nomic-embed-text")
+# Chat/generate model for query translation (CLIP is English-centric).
+# Prefer an installed chat model; override with VDL_OLLAMA_CHAT_MODEL.
+OLLAMA_CHAT_MODEL = os.environ.get("VDL_OLLAMA_CHAT_MODEL", "gemma4")
+# Auto-translate non-English queries before CLIP text search (1=on).
+SEARCH_TRANSLATE = os.environ.get("VDL_SEARCH_TRANSLATE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+# Diversity: max hits per URL host in aggregated results (0 = no cap).
+SEARCH_MAX_PER_DOMAIN = max(0, int(os.environ.get("VDL_SEARCH_MAX_PER_DOMAIN", "2")))
 FRAMES_PER_SCENE = int(os.environ.get("VDL_FRAMES_PER_SCENE", "5"))
 # Background daemon exits after this many idle seconds with empty queue (0 = never).
 DAEMON_IDLE_SEC = float(os.environ.get("VDL_DAEMON_IDLE_SEC", "60"))

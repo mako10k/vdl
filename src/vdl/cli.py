@@ -24,7 +24,7 @@ from vdl.daemon import (
     start_background,
     stop_daemon,
 )
-from vdl.queue import Job, JobQueue
+from vdl.queue import Job, JobKind, JobQueue
 from vdl.registry import Registry
 from vdl.supervisor import (
     ensure_runtime,
@@ -35,7 +35,7 @@ from vdl.supervisor import (
     supervisor_status,
 )
 from vdl.util import normalize_url
-from vdl.workers import enqueue_download, enqueue_index_chain
+from vdl.workers import enqueue_download, enqueue_index_chain, enqueue_startup_maintenance
 
 console = Console()
 
@@ -660,13 +660,7 @@ def queue_group() -> None:
 @click.option(
     "--kind",
     type=click.Choice(
-        [
-            "download",
-            "scene_detect",
-            "clip_optimize",
-            "embed",
-            "daemon_reload",
-        ],
+        [k.value for k in JobKind],
         case_sensitive=False,
     ),
     default=None,
@@ -869,6 +863,24 @@ def queue_retry(ctx: click.Context, job_id: int) -> None:
         sys.exit(1)
     console.print(f"retry job_id={job.id} status={job.status}")
     if job.status == "pending":
+        _auto_start_daemon(config)
+
+
+@queue_group.command("maintain")
+@click.option("--no-daemon", is_flag=True, help="デーモン自動起動しない")
+@click.pass_context
+def queue_maintain(ctx: click.Context, no_daemon: bool) -> None:
+    """重複除去と .ts→.mp4 をキューに載せる（API 起動時と同じ）"""
+    config: Config = ctx.obj["config"]
+    q = JobQueue(config.db_path)
+    jobs = enqueue_startup_maintenance(q)
+    remux = jobs["ts_to_mp4"]
+    dedup = jobs["dedup"]
+    console.print(
+        f"[green]maintenance queued[/green] "
+        f"ts_to_mp4={remux.id} dedup={dedup.id} (depends on {dedup.depends_on_job_id})"
+    )
+    if not no_daemon:
         _auto_start_daemon(config)
 
 
@@ -1293,25 +1305,40 @@ def search_group() -> None:
     is_flag=True,
     help="download 単位に集約せずシーン単位で表示",
 )
+@click.option(
+    "--modality",
+    type=click.Choice(["clip", "text"], case_sensitive=False),
+    default="clip",
+    show_default=True,
+    help="clip=見た目（CLIP・既定）/ text=メタデータ（Ollama・ファイル名寄り）",
+)
 @click.pass_context
 def search_text_cmd(
-    ctx: click.Context, query: str, limit: int, by_scene: bool
+    ctx: click.Context, query: str, limit: int, by_scene: bool, modality: str
 ) -> None:
-    """テキストクエリとインデックスの類似度で検索（Ollama embed）"""
+    """テキストクエリで検索（既定: CLIP オープン語彙の視覚検索）"""
     config: Config = ctx.obj["config"]
     from vdl.search import SearchService
 
     try:
-        hits = SearchService(config).search_text(
-            query, limit=limit, by_download=not by_scene
+        out = SearchService(config).search_text_ex(
+            query,
+            limit=limit,
+            by_download=not by_scene,
+            modality=modality,  # type: ignore[arg-type]
         )
     except Exception as e:
         console.print(f"[red]検索失敗[/red] {e}")
         sys.exit(1)
-    _print_search_hits(
-        hits,
-        title=f"text search: {query!r}" + (" (scenes)" if by_scene else " (by download)"),
+    title = (
+        f"text search [{out.modality}]: {query!r}"
+        + (" (scenes)" if by_scene else " (by download)")
     )
+    if out.translated:
+        console.print(f"[dim]CLIP query (EN): {out.query_used!r}[/dim]")
+    for note in out.notes:
+        console.print(f"[dim]{note}[/dim]")
+    _print_search_hits(out.hits, title=title)
 
 
 @search_group.command("similar")

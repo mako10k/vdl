@@ -14,6 +14,8 @@ from typing import Any, Iterator, Optional
 
 class JobKind(str, Enum):
     DOWNLOAD = "download"
+    TS_TO_MP4 = "ts_to_mp4"
+    DEDUP = "dedup"
     SCENE_DETECT = "scene_detect"
     CLIP_OPTIMIZE = "clip_optimize"
     EMBED = "embed"
@@ -84,6 +86,8 @@ def is_retryable_error(error: str | None, *, kind: str | None = None) -> bool:
     # download / index stages: default optimistic for transient infra flakes
     if kind in {
         JobKind.DOWNLOAD.value,
+        JobKind.TS_TO_MP4.value,
+        JobKind.DEDUP.value,
         JobKind.SCENE_DETECT.value,
         JobKind.CLIP_OPTIMIZE.value,
         JobKind.EMBED.value,
@@ -748,16 +752,40 @@ class JobQueue:
 
     def find_active_reload(self) -> Optional[Job]:
         """Pending or running daemon_reload job (newest)."""
+        return self.find_active_kind(JobKind.DAEMON_RELOAD)
+
+    def find_active_kind(
+        self,
+        kind: JobKind | str,
+        *,
+        download_id: int | None = None,
+        require_null_download_id: bool = False,
+        statuses: tuple[str, ...] = ("pending", "running"),
+    ) -> Optional[Job]:
+        """Newest job of this kind in the given statuses, optionally scoped to a download."""
+        k = kind.value if isinstance(kind, JobKind) else kind
+        if not statuses:
+            return None
+        placeholders = ",".join("?" * len(statuses))
+        args: list[Any] = [k]
+        extra = ""
+        if require_null_download_id:
+            extra = " AND download_id IS NULL"
+        elif download_id is not None:
+            extra = " AND download_id = ?"
+            args.append(download_id)
+        args.extend(statuses)
         with self._conn() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT * FROM jobs
                 WHERE kind = ?
-                  AND status IN ('pending', 'running')
+                  {extra}
+                  AND status IN ({placeholders})
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (JobKind.DAEMON_RELOAD.value,),
+                args,
             ).fetchone()
             return self._row(row) if row else None
 
@@ -1303,6 +1331,49 @@ class JobQueue:
                     # Always walk dependents (scene→clip→embed chain)
                     queue_ids.append(cid)
         return cancelled
+
+    def cancel_for_download(
+        self,
+        download_id: int,
+        *,
+        reason: str = "download collapsed as duplicate",
+    ) -> list[int]:
+        """Cancel pending jobs tied to a download (running jobs are left alone)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE download_id = ?
+                  AND status = 'pending'
+                ORDER BY id ASC
+                """,
+                (download_id,),
+            ).fetchall()
+        cancelled: list[int] = []
+        for row in rows:
+            job = self.cancel(int(row["id"]), cascade=True)
+            if job and job.status == "cancelled":
+                cancelled.append(job.id)
+                with self._conn() as conn:
+                    conn.execute(
+                        """
+                        UPDATE jobs SET error = ?, progress_msg = ?
+                        WHERE id = ?
+                        """,
+                        (reason, reason, job.id),
+                    )
+        return cancelled
+
+    def scene_counts(self) -> dict[int, int]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT download_id, COUNT(*) AS n
+                FROM scenes
+                GROUP BY download_id
+                """
+            ).fetchall()
+            return {int(r["download_id"]): int(r["n"]) for r in rows}
 
     def cancel(self, job_id: int, *, cascade: bool = True) -> Optional[Job]:
         now = _utc_now()

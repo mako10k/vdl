@@ -85,6 +85,26 @@ def test_find_by_hash(reg: Registry) -> None:
     assert reg.find_by_hash("nope") is None
 
 
+def test_update_artifact_and_list_unlimited(reg: Registry) -> None:
+    r = reg.create("https://ex.com/a.ts", source_type=SourceType.DIRECT, title="a.ts")
+    reg.mark_completed(r.id, file_path="/tmp/a.ts", file_size=10, file_hash="aa")
+    done = reg.update_artifact(
+        r.id,
+        file_path="/tmp/a.mp4",
+        file_size=11,
+        file_hash="bb",
+        content_type="video/mp4",
+        title="a.mp4",
+        meta_update={"remuxed_from": "/tmp/a.ts"},
+    )
+    assert done.file_path == "/tmp/a.mp4"
+    assert done.file_hash == "bb"
+    assert done.meta["remuxed_from"] == "/tmp/a.ts"
+    twins = reg.find_all_by_hash("bb")
+    assert len(twins) == 1
+    assert reg.list_all(limit=None)
+
+
 def test_list_and_get(reg: Registry) -> None:
     a = reg.create("https://a", source_type=SourceType.DIRECT)
     reg.mark_completed(a.id, file_path="/a")

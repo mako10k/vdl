@@ -7,13 +7,16 @@ from typing import Any
 
 from vdl.config import (
     PRIORITY_CLIP,
+    PRIORITY_DEDUP,
     PRIORITY_EMBED,
     PRIORITY_SCENE,
+    PRIORITY_TS_TO_MP4,
     Config,
 )
 from vdl.index.clip_opt import select_keyframe_for_scene
 from vdl.index.embed import embed_scene_text
 from vdl.index.scene import detect_scenes
+from vdl.maintenance import is_ts_path, run_dedup, run_ts_to_mp4
 from vdl.queue import Job, JobKind, JobQueue
 from vdl.registry import Registry
 from vdl.service import DownloadService
@@ -58,6 +61,61 @@ def enqueue_download(
     )
 
 
+def enqueue_ts_to_mp4(
+    queue: JobQueue,
+    download_id: int | None = None,
+    *,
+    depends_on_job_id: int | None = None,
+) -> Job:
+    """Enqueue MPEG-TS remux. download_id=None sweeps the whole registry."""
+    existing = queue.find_active_kind(
+        JobKind.TS_TO_MP4,
+        download_id=download_id,
+        require_null_download_id=download_id is None,
+        statuses=("pending",),
+    )
+    if existing:
+        return existing
+    payload: dict[str, Any] = (
+        {"download_id": download_id} if download_id is not None else {"scope": "all"}
+    )
+    return queue.enqueue(
+        JobKind.TS_TO_MP4,
+        priority=PRIORITY_TS_TO_MP4,
+        download_id=download_id,
+        depends_on_job_id=depends_on_job_id,
+        payload=payload,
+    )
+
+
+def enqueue_dedup(
+    queue: JobQueue,
+    *,
+    depends_on_job_id: int | None = None,
+) -> Job:
+    """Enqueue a singleton content-hash dedup sweep."""
+    existing = queue.find_active_kind(
+        JobKind.DEDUP,
+        require_null_download_id=True,
+        statuses=("pending",),
+    )
+    if existing:
+        return existing
+    return queue.enqueue(
+        JobKind.DEDUP,
+        priority=PRIORITY_DEDUP,
+        depends_on_job_id=depends_on_job_id,
+        payload={"scope": "all"},
+    )
+
+
+def enqueue_startup_maintenance(queue: JobQueue) -> dict[str, Job]:
+    """API/registry boot: remux leftover .ts, then collapse duplicate files."""
+    remux = enqueue_ts_to_mp4(queue)
+    dedup = enqueue_dedup(queue, depends_on_job_id=remux.id)
+    return {"ts_to_mp4": remux, "dedup": dedup}
+
+
 def enqueue_index_chain(
     queue: JobQueue,
     download_id: int,
@@ -93,6 +151,10 @@ def run_job(config: Config, job: Job) -> dict[str, Any]:
     queue = JobQueue(config.db_path)
     if job.kind == JobKind.DOWNLOAD.value:
         return _run_download(config, queue, job)
+    if job.kind == JobKind.TS_TO_MP4.value:
+        return _run_ts_to_mp4(config, queue, job)
+    if job.kind == JobKind.DEDUP.value:
+        return _run_dedup(config, queue, job)
     if job.kind == JobKind.SCENE_DETECT.value:
         return _run_scene(config, queue, job)
     if job.kind == JobKind.CLIP_OPTIMIZE.value:
@@ -200,12 +262,22 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
     if downloaded_ids:
         queue.set_download_id(job.id, downloaded_ids[0])
 
-    if not p.get("no_index"):
+    if any(r.status == "downloaded" for r in results):
+        enqueue_dedup(queue)
+
+    no_index = bool(p.get("no_index"))
+    if downloaded_ids:
         reg = Registry(config.db_path)
         for did in downloaded_ids:
             rec = reg.get(did)
-            if rec and rec.status == "completed" and rec.file_path:
-                enqueue_index_chain(queue, did)
+            if not rec or rec.status != "completed" or not rec.file_path:
+                continue
+            after: int | None = None
+            if is_ts_path(rec.file_path):
+                remux = enqueue_ts_to_mp4(queue, download_id=did)
+                after = remux.id
+            if not no_index:
+                enqueue_index_chain(queue, did, after_job_id=after)
 
     failed = [r for r in results if r.status == "failed"]
     # Candidate listing only (HTML scrape without download)
@@ -256,6 +328,59 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
         "paths": artifact_paths,
         "failed": [{"message": r.message, "record_id": r.record_id} for r in failed],
     }
+
+
+def _run_ts_to_mp4(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
+    def on_progress(
+        pct: float | None,
+        message: str | None,
+        current: int | None,
+        total: int | None,
+    ) -> None:
+        _progress(
+            queue,
+            job,
+            pct=pct,
+            message=message,
+            current=current,
+            total=total,
+        )
+
+    download_id = job.payload.get("download_id")
+    if download_id is None:
+        download_id = job.download_id
+    result = run_ts_to_mp4(
+        config,
+        download_id=int(download_id) if download_id is not None else None,
+        on_progress=on_progress,
+    )
+    n = len(result.get("converted") or [])
+    if n:
+        enqueue_dedup(queue)
+    _progress(queue, job, pct=100.0, message=f"ts_to_mp4 converted={n}")
+    return result
+
+
+def _run_dedup(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
+    def on_progress(
+        pct: float | None,
+        message: str | None,
+        current: int | None,
+        total: int | None,
+    ) -> None:
+        _progress(
+            queue,
+            job,
+            pct=pct,
+            message=message,
+            current=current,
+            total=total,
+        )
+
+    result = run_dedup(config, on_progress=on_progress)
+    n = len(result.get("groups") or [])
+    _progress(queue, job, pct=100.0, message=f"dedup groups={n}")
+    return result
 
 
 def _require_download(reg: Registry, download_id: int) -> Any:

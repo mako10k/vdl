@@ -21,22 +21,30 @@ cd /path/to/video
 pip install -e ".[web]"
 cd web && npm install
 
-# ターミナル1: API
-cd /path/to/video
-export VDL_HOME=~/.vdl   # 任意
-export VDL_API_PORT=18765
-uvicorn api.main:app --reload --host 127.0.0.1 --port 18765
-# または: vdl-api
-
-# ターミナル2: UI
-cd web
-npm run dev
+# API と UI を同時に起動（推奨）
+npm run dev:all
 ```
 
 - ブラウザ: http://127.0.0.1:18766  
 - API docs: http://127.0.0.1:18765/docs  
 
+停止は `Ctrl+C` です。`dev:all` は API を `--reload` で起動するため、バックエンドと UI の変更を開発中に反映します。対象ポートで VDL API がすでに稼働していれば、それを再利用し、停止しません。
+
 開発時、Vite は `/api` を `VDL_API_PORT`（既定 18765）へプロキシします。
+
+### 個別起動
+
+API を別ターミナルや別プロセスで管理したい場合のみ、次のように起動します。
+
+```bash
+# ターミナル1: API
+uvicorn api.main:app --reload --host 127.0.0.1 --port 18765
+
+# ターミナル2: UI
+cd web && npm run dev
+```
+
+UI 上部に `API · unavailable` と表示された場合は API が未起動、または API/UI 間で `VDL_API_PORT` が一致していません。`runtime · idle (auto-start)` はキューが空の正常な待機状態で、ジョブ投入時に worker が自動起動します。
 
 ## 機能
 

@@ -8,10 +8,12 @@ Run:
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -27,9 +29,41 @@ from vdl.registry import Registry
 from vdl.search import SearchService
 from vdl.service import DownloadService
 from vdl.supervisor import ensure_runtime, supervisor_status
-from vdl.workers import enqueue_download, enqueue_index_chain
+from vdl.workers import (
+    enqueue_download,
+    enqueue_index_chain,
+    enqueue_startup_maintenance,
+)
 
-app = FastAPI(title="vdl API", version="0.1.0")
+log = logging.getLogger("vdl.api")
+
+
+def _enqueue_boot_maintenance() -> None:
+    """On API (registry) start, queue leftover .ts remux + content-hash dedup."""
+    cfg = get_config()
+    q = JobQueue(cfg.db_path)
+    jobs = enqueue_startup_maintenance(q)
+    log.info(
+        "startup maintenance queued ts_to_mp4=%s dedup=%s",
+        jobs["ts_to_mp4"].id,
+        jobs["dedup"].id,
+    )
+    try:
+        ensure_runtime(cfg)
+    except Exception:
+        log.exception("failed to start worker runtime after maintenance enqueue")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        _enqueue_boot_maintenance()
+    except Exception:
+        log.exception("startup maintenance enqueue failed")
+    yield
+
+
+app = FastAPI(title="vdl API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +111,8 @@ class TextSearchBody(BaseModel):
     query: str
     limit: int = 8
     by_scene: bool = False
+    # clip = CLIP text→keyframe (visual, default); text = Ollama metadata docs
+    modality: str = "clip"
 
 
 class SimilarSearchBody(BaseModel):
@@ -151,6 +187,22 @@ def status() -> dict[str, Any]:
         "worker": daemon_status(cfg),
         "queue_counts": q.counts(include_archived=False),
         "queue_counts_all": q.counts(include_archived=True),
+    }
+
+
+@app.post("/api/queue/maintain")
+def queue_maintain() -> dict[str, Any]:
+    """Enqueue leftover .ts remux + content-hash dedup (same as API boot)."""
+    cfg = get_config()
+    q = JobQueue(cfg.db_path)
+    jobs = enqueue_startup_maintenance(q)
+    role, pid, started = ensure_runtime(cfg)
+    return {
+        "jobs": {
+            "ts_to_mp4": _job_dict(jobs["ts_to_mp4"]),
+            "dedup": _job_dict(jobs["dedup"]),
+        },
+        "runtime": {"role": role, "pid": pid, "started": started},
     }
 
 
@@ -549,19 +601,29 @@ def registry_reindex(download_id: int) -> dict[str, Any]:
 def search_text(body: TextSearchBody) -> dict[str, Any]:
     cfg = get_config()
     try:
-        hits = SearchService(cfg).search_text(
-            body.query, limit=body.limit, by_download=not body.by_scene
+        out = SearchService(cfg).search_text_ex(
+            body.query,
+            limit=body.limit,
+            by_download=not body.by_scene,
+            modality=body.modality,  # type: ignore[arg-type]
         )
     except Exception as e:
         raise HTTPException(400, str(e)) from e
-    return {"hits": [_hit_dict(h, with_preview=True) for h in hits]}
+    return {
+        "hits": [_hit_dict(h, with_preview=True) for h in out.hits],
+        "query": out.query,
+        "query_used": out.query_used,
+        "translated": out.translated,
+        "modality": out.modality,
+        "notes": out.notes,
+    }
 
 
 @app.post("/api/search/similar")
 def search_similar(body: SimilarSearchBody) -> dict[str, Any]:
     cfg = get_config()
     try:
-        hits = SearchService(cfg).search_similar(
+        out = SearchService(cfg).search_similar_ex(
             body.download_id,
             scene_index=body.scene_index,
             limit=body.limit,
@@ -570,7 +632,14 @@ def search_similar(body: SimilarSearchBody) -> dict[str, Any]:
         )
     except Exception as e:
         raise HTTPException(400, str(e)) from e
-    return {"hits": [_hit_dict(h, with_preview=True) for h in hits]}
+    return {
+        "hits": [_hit_dict(h, with_preview=True) for h in out.hits],
+        "query": out.query,
+        "query_used": out.query_used,
+        "translated": out.translated,
+        "modality": out.modality,
+        "notes": out.notes,
+    }
 
 
 @app.get("/api/files/{download_id}")

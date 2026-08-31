@@ -163,10 +163,22 @@ export const api = {
     req<{ jobs: Record<string, number> }>(`/api/registry/${id}/reindex`, {
       method: 'POST',
     }),
-  searchText: (query: string, limit = 8, by_scene = false) =>
-    req<{ hits: SearchHit[] }>('/api/search/text', {
+  searchText: (
+    query: string,
+    limit = 8,
+    by_scene = false,
+    modality: 'clip' | 'text' = 'clip',
+  ) =>
+    req<{
+      hits: SearchHit[]
+      query?: string
+      query_used?: string
+      translated?: boolean
+      modality?: string
+      notes?: string[]
+    }>('/api/search/text', {
       method: 'POST',
-      body: JSON.stringify({ query, limit, by_scene }),
+      body: JSON.stringify({ query, limit, by_scene, modality }),
     }),
   searchSimilar: (
     download_id: number,
@@ -175,7 +187,14 @@ export const api = {
     by_scene = false,
     scene_index?: number | null,
   ) =>
-    req<{ hits: SearchHit[] }>('/api/search/similar', {
+    req<{
+      hits: SearchHit[]
+      query?: string
+      query_used?: string
+      translated?: boolean
+      modality?: string
+      notes?: string[]
+    }>('/api/search/similar', {
       method: 'POST',
       body: JSON.stringify({
         download_id,

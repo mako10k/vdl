@@ -29,12 +29,18 @@ export type PlayRequest = {
 
 function StatusBadge({
   label,
-  on,
+  tone,
+  title,
 }: {
   label: string
-  on: boolean
+  tone: 'neutral' | 'info' | 'success' | 'warning' | 'danger'
+  title?: string
 }) {
-  return <span className={`badge ${on ? 'on' : 'off'}`}>{label}</span>
+  return (
+    <span className={`badge ${tone}`} title={title}>
+      {label}
+    </span>
+  )
 }
 
 function JobStatus({ s }: { s: string }) {
@@ -285,6 +291,9 @@ export default function App() {
   const [err, setErr] = useState<string | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
 
+  const [apiState, setApiState] = useState<'checking' | 'online' | 'offline'>(
+    'checking',
+  )
   const [supOn, setSupOn] = useState(false)
   const [workerOn, setWorkerOn] = useState(false)
   const [counts, setCounts] = useState<Record<string, number>>({})
@@ -296,6 +305,7 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [searchByScene, setSearchByScene] = useState(false)
   const [searchModality, setSearchModality] = useState<'clip' | 'text'>('clip')
+  const [textIndex, setTextIndex] = useState<'clip' | 'text'>('clip')
 
   const [jobs, setJobs] = useState<Job[]>([])
   const [allDone, setAllDone] = useState(false)
@@ -324,11 +334,16 @@ export default function App() {
   const refreshStatus = useCallback(async () => {
     try {
       const st = await api.status()
+      setApiState('online')
       setSupOn(!!st.supervisor?.running)
       setWorkerOn(!!st.worker?.running)
       setCounts(st.queue_counts || {})
     } catch {
-      /* ignore poll errors */
+      // Do not show the initial "off" state when the API itself is unavailable.
+      setApiState('offline')
+      setSupOn(false)
+      setWorkerOn(false)
+      setCounts({})
     }
   }, [])
 
@@ -550,11 +565,20 @@ export default function App() {
     if (!searchQ.trim()) return
     setBusy(true)
     try {
-      const r = await api.searchText(searchQ.trim(), 8, searchByScene)
-      setHits(r.hits)
-      setSearchTitle(
-        `text: ${searchQ.trim()}${searchByScene ? ' [by scene]' : ''}`,
+      const r = await api.searchText(
+        searchQ.trim(),
+        8,
+        searchByScene,
+        textIndex,
       )
+      setHits(r.hits)
+      let title = `text [${r.modality || textIndex}]: ${searchQ.trim()}${
+        searchByScene ? ' [by scene]' : ''
+      }`
+      if (r.translated && r.query_used) {
+        title += ` → EN: ${r.query_used}`
+      }
+      setSearchTitle(title)
     } catch (e) {
       setErr(String(e))
     } finally {
@@ -584,6 +608,49 @@ export default function App() {
 
   const scenes: Scene[] = detail?.scenes || []
   const scenesWithKf = scenes.filter((s) => s.has_keyframe !== false)
+  const activeJobCount = (counts.pending || 0) + (counts.running || 0)
+  const runtimeBadge = (() => {
+    if (apiState === 'checking') {
+      return {
+        label: 'runtime · checking',
+        tone: 'neutral' as const,
+        title: 'API の状態を確認中です',
+      }
+    }
+    if (apiState === 'offline') {
+      return {
+        label: 'runtime · unavailable',
+        tone: 'danger' as const,
+        title: 'API に接続できないため、worker の状態は確認できません',
+      }
+    }
+    if (workerOn) {
+      return {
+        label: 'runtime · processing',
+        tone: 'success' as const,
+        title: 'worker がキューを処理しています',
+      }
+    }
+    if (supOn) {
+      return {
+        label: 'runtime · monitoring',
+        tone: 'info' as const,
+        title: 'supervisor が worker の起動を監視しています',
+      }
+    }
+    if (activeJobCount > 0) {
+      return {
+        label: 'runtime · starting',
+        tone: 'warning' as const,
+        title: '処理待ちジョブがあります。supervisor が worker を起動します',
+      }
+    }
+    return {
+      label: 'runtime · idle (auto-start)',
+      tone: 'info' as const,
+      title: 'キューが空のため停止中です。ジョブ投入時に自動起動します',
+    }
+  })()
 
   return (
     <div className="app">
@@ -593,20 +660,38 @@ export default function App() {
         </h1>
         <div className="badge-row">
           <StatusBadge
-            label={supOn ? `supervisor · on` : 'supervisor · off'}
-            on={supOn}
+            label={
+              apiState === 'checking'
+                ? 'API · checking'
+                : apiState === 'online'
+                  ? 'API · connected'
+                  : 'API · unavailable'
+            }
+            tone={
+              apiState === 'checking'
+                ? 'neutral'
+                : apiState === 'online'
+                  ? 'success'
+                  : 'danger'
+            }
           />
           <StatusBadge
-            label={workerOn ? `worker · on` : 'worker · off'}
-            on={workerOn}
+            label={runtimeBadge.label}
+            tone={runtimeBadge.tone}
+            title={runtimeBadge.title}
           />
           {Object.entries(counts).map(([k, v]) => (
-            <span key={k} className="badge">
-              {k}={v}
-            </span>
+            <StatusBadge key={k} label={`${k}=${v}`} tone="neutral" />
           ))}
         </div>
       </header>
+
+      {apiState === 'offline' && (
+        <div className="api-warning" role="alert">
+          API に接続できません。Web ディレクトリで <code>npm run dev:all</code>{' '}
+          を実行するか、API と UI の <code>VDL_API_PORT</code> を一致させてください。
+        </div>
+      )}
 
       <nav className="tabs">
         {(
@@ -1167,6 +1252,14 @@ export default function App() {
               onChange={(e) => setSearchQ(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && onSearchText()}
             />
+            <select
+              value={textIndex}
+              onChange={(e) => setTextIndex(e.target.value as 'clip' | 'text')}
+              title="clip=見た目 / text=ファイル名メタ"
+            >
+              <option value="clip">visual (CLIP)</option>
+              <option value="text">metadata (Ollama)</option>
+            </select>
             <label className="muted">
               <input
                 type="checkbox"
@@ -1179,6 +1272,10 @@ export default function App() {
               Text search
             </button>
           </div>
+          <p className="muted" style={{ marginTop: 0 }}>
+            既定は CLIP（キーフレームの見た目）。metadata
+            は title/URL のみで中身の語には弱いです。
+          </p>
           <div className="row">
             <input
               type="number"

@@ -314,23 +314,90 @@ class Registry:
         self,
         *,
         status: str | None = None,
-        limit: int = 50,
+        limit: int | None = 50,
     ) -> list[DownloadRecord]:
         with self._conn() as conn:
+            clauses: list[str] = []
+            args: list[Any] = []
             if status:
+                clauses.append("status = ?")
+                args.append(status)
+            where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            sql = f"SELECT * FROM downloads{where} ORDER BY id DESC"
+            if limit is not None:
+                sql += " LIMIT ?"
+                args.append(int(limit))
+            rows = conn.execute(sql, args).fetchall()
+            return [self._row_to_record(r) for r in rows]
+
+    def find_all_by_hash(
+        self, file_hash: str, *, completed_only: bool = True
+    ) -> list[DownloadRecord]:
+        with self._conn() as conn:
+            if completed_only:
                 rows = conn.execute(
                     """
-                    SELECT * FROM downloads WHERE status = ?
-                    ORDER BY id DESC LIMIT ?
+                    SELECT * FROM downloads
+                    WHERE file_hash = ? AND status = 'completed'
+                    ORDER BY id ASC
                     """,
-                    (status, limit),
+                    (file_hash,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM downloads ORDER BY id DESC LIMIT ?",
-                    (limit,),
+                    """
+                    SELECT * FROM downloads
+                    WHERE file_hash = ?
+                    ORDER BY id ASC
+                    """,
+                    (file_hash,),
                 ).fetchall()
             return [self._row_to_record(r) for r in rows]
+
+    def update_artifact(
+        self,
+        record_id: int,
+        *,
+        file_path: str | None = None,
+        file_size: int | None = None,
+        file_hash: str | None = None,
+        content_type: str | None = None,
+        title: str | None = None,
+        meta_update: dict[str, Any] | None = None,
+    ) -> DownloadRecord:
+        rec = self.get(record_id)
+        if rec is None:
+            raise KeyError(f"download {record_id} not found")
+        now = _utc_now()
+        path = file_path if file_path is not None else rec.file_path
+        size = file_size if file_size is not None else rec.file_size
+        digest = file_hash if file_hash is not None else rec.file_hash
+        ctype = content_type if content_type is not None else rec.content_type
+        title_v = title if title is not None else rec.title
+        meta = rec.meta
+        if meta_update:
+            meta = {**meta, **meta_update}
+        meta_json = json.dumps(meta, ensure_ascii=False)
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE downloads SET
+                    file_path = ?,
+                    file_size = ?,
+                    file_hash = ?,
+                    content_type = ?,
+                    title = ?,
+                    meta_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (path, size, digest, ctype, title_v, meta_json, now, record_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM downloads WHERE id = ?", (record_id,)
+            ).fetchone()
+            assert row is not None
+            return self._row_to_record(row)
 
     def get(self, record_id: int) -> Optional[DownloadRecord]:
         with self._conn() as conn:

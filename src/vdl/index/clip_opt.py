@@ -74,6 +74,34 @@ def embed_image_paths(paths: list[Path]) -> np.ndarray:
     return feats.detach().cpu().numpy()
 
 
+def embed_text_clip(text: str, *, prompts: list[str] | None = None) -> list[float]:
+    """
+    L2-normalized CLIP text embedding for open-vocabulary visual search.
+
+    Averages several prompt templates so short queries (incl. non-English tokens)
+    still land near the image embedding manifold used for keyframes.
+    """
+    import torch
+
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty text")
+    templates = prompts or [
+        text,
+        f"a photo of {text}",
+        f"a video scene of {text}",
+        f"a still frame showing {text}",
+    ]
+    model, _, tokenizer, device = _load_clip()
+    tokens = tokenizer(templates).to(device)
+    with _clip_lock, torch.no_grad():
+        feats = model.encode_text(tokens)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        avg = feats.mean(dim=0)
+        avg = avg / avg.norm()
+    return [float(x) for x in avg.detach().cpu().tolist()]
+
+
 def select_keyframe_for_scene(
     video_path: Path,
     start_sec: float,

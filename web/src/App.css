@@ -73,13 +73,38 @@ header h1 span {
   color: var(--muted);
 }
 
-.badge.on {
+.badge.success {
   color: var(--ok);
   border-color: #2f6f46;
 }
 
-.badge.off {
+.badge.info {
+  color: #74c0fc;
+  border-color: #315c86;
+}
+
+.badge.warning {
   color: var(--warn);
+  border-color: #78601b;
+}
+
+.badge.danger {
+  color: var(--danger);
+  border-color: #8b3f47;
+}
+
+.api-warning {
+  margin: -0.45rem 0 1rem;
+  color: #ffd8a8;
+  background: #3b2d1d;
+  border: 1px solid #7c5722;
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.9rem;
+}
+
+.api-warning code {
+  color: #fff3bf;
 }
 
 .tabs {

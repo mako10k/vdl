@@ -1,14 +1,73 @@
-"""Search helpers: score aggregation (no Ollama required)."""
+"""Search helpers: score aggregation + diversity (no Ollama required)."""
 
 from __future__ import annotations
 
-from vdl.search import SearchHit, _aggregate_by_download, _distance_to_score
+from vdl.index.embed import needs_clip_translation
+from vdl.search import (
+    SearchHit,
+    _aggregate_by_download,
+    _distance_to_score,
+    _diversify_hits,
+    _host_key,
+)
 
 
 def test_distance_to_score() -> None:
     assert _distance_to_score(0.0) == 1.0
     assert _distance_to_score(0.5) == 0.5
     assert _distance_to_score(None) == 0.0
+
+
+def test_needs_clip_translation() -> None:
+    assert needs_clip_translation("海辺") is True
+    assert needs_clip_translation("車") is True
+    assert needs_clip_translation("a red car") is False
+    assert needs_clip_translation("beach") is False
+
+
+def test_diversify_limits_per_domain() -> None:
+    hits = [
+        SearchHit(
+            rank=i,
+            download_id=i,
+            scene_id=i,
+            scene_index=0,
+            score=1.0 - i * 0.01,
+            distance=i * 0.01,
+            modality="clip",
+            title=f"t{i}",
+            path=None,
+            url=f"https://same.cdn.example.com/v{i}.mp4",
+            document="",
+            chroma_id=f"c{i}",
+        )
+        for i in range(1, 8)
+    ]
+    hits.append(
+        SearchHit(
+            rank=99,
+            download_id=99,
+            scene_id=99,
+            scene_index=0,
+            score=0.5,
+            distance=0.5,
+            modality="clip",
+            title="other",
+            path=None,
+            url="https://other.example.org/x.mp4",
+            document="",
+            chroma_id="c99",
+        )
+    )
+    # limit=3: 2 from dominant host + 1 other (no need to relax cap)
+    out = _diversify_hits(hits, limit=3, max_per_domain=2)
+    assert len(out) == 3
+    hosts = [_host_key(h.url, h.title) for h in out]
+    from collections import Counter
+
+    c = Counter(hosts)
+    assert c.get("same.cdn.example.com", 0) <= 2
+    assert "other.example.org" in hosts
 
 
 def test_aggregate_by_download_picks_best_and_excludes() -> None:

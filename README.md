@@ -7,11 +7,15 @@ URL から動画を取得し、**ローカルレジストリ**と**埋め込み�
 | 優先 | ジョブ | 内容 |
 |------|--------|------|
 | 100 | `download` | 動画 / m3u8 / HTML からの取得 |
+| 50 | `ts_to_mp4` | レジストリ内の `.ts` を ffmpeg で `.mp4` にリマックス |
+| 45 | `dedup` | 同一ファイルを1本に。`.ts` 変換済みは元ハッシュを両方持っているときだけ任意比較（無い／片側は変換後ハッシュ） |
 | 40 | `scene_detect` | シーン検出 (ffmpeg) |
 | 30 | `clip_optimize` | CLIP で代表キーフレーム選定 |
 | 20 | `embed` | ローカル Ollama (`nomic-embed-text`) でテキストベクトル化 |
 
-**ダウンロードが常に最優先**。キューが空いたら索引パイプラインを進めます。
+**ダウンロードが常に最優先**。キューが空いたら `.ts` 変換・重複除去、そのあと索引パイプラインを進めます。
+
+API サーバ起動時に `ts_to_mp4`（レジストリ全件スイープ）と `dedup`（変換後）を自動投入します。手動は `vdl queue maintain` または `POST /api/queue/maintain`。
 
 ## 設計・計画
 
@@ -65,8 +69,11 @@ vdl registry list
 vdl registry show 1
 
 # 検索
-vdl search text '海辺のシーン'          # テキスト↔埋め込み類似
-vdl search similar 2                   # レジストリ id=2 に見た目が似ている動画
+# 既定: CLIP 視覚検索（日本語は Ollama で英訳してから検索）
+vdl search text '海辺のシーン'
+vdl search text 'beach' --modality clip
+vdl search text 'index.mp4' --modality text   # ファイル名メタ寄り
+vdl search similar 2                   # 見た目が似ている動画（CLIP）
 vdl search similar 2 --modality text   # テキスト埋め込みでの類似
 vdl search similar 2 --scene 3         # シーン 3 を基準
 vdl registry search '夕焼け'           # alias
@@ -137,6 +144,7 @@ vdl daemon run --workers 3 --idle 60
 | `vdl get URL --no-index` | 索引チェーンを載せない |
 | `vdl queue list/show/cancel/retry` | キュー操作 |
 | `vdl queue reindex <download_id>` | scene→clip→embed 再投入（API は `POST /api/registry/{id}/reindex`） |
+| `vdl queue maintain` | `.ts`→`.mp4` + 重複除去を投入（API 起動時と同じ。`POST /api/queue/maintain`） |
 | `vdl watch` | キュー進捗のライブ表示 |
 | `vdl supervisor start/stop/status/run` | **スーパーバイザ**（ワーカー監視・再起動） |
 | `vdl daemon start/stop/status/run` | ワーカー（**最大3並列**） |
@@ -184,13 +192,16 @@ vdl daemon run   # フォアグラウンドで処理
 export VDL_OLLAMA_EMBED_MODEL=nomic-embed-text
 export VDL_CLIP_MODEL=ViT-B-32
 export VDL_SCENE_THRESHOLD=0.3
+# 検索: 日本語→英語（CLIP 用）と結果のドメイン多様性
+export VDL_OLLAMA_CHAT_MODEL=gemma4   # インストール済みチャットモデル
+export VDL_SEARCH_TRANSLATE=1
+export VDL_SEARCH_MAX_PER_DOMAIN=2
 ```
 
 ## 非目標（MVP）
 
 - DRM / DASH 完全対応
 - 複数ホストにまたがる分散ワーカー（単一プロセス内の `VDL_DAEMON_WORKERS` 並列は対応）
-- CLIP によるテキスト→画像クロスモーダル検索（text 検索が主）
 
 ## 開発
 
@@ -211,13 +222,14 @@ python -m vdl daemon status
 
 ```bash
 pip install -e ".[web]"
-# API
-uvicorn api.main:app --reload --host 127.0.0.1 --port 18765
-# Frontend
-cd web && npm install && npm run dev
+cd web && npm install
+# API と Frontend を同時に起動
+npm run dev:all
 ```
 
 - UI: http://127.0.0.1:18766  
 - API docs: http://127.0.0.1:18765/docs  
+
+`npm run dev:all` は起動した API と UI を一緒に停止します。API がすでに動いていれば再利用し、停止しません。個別起動も可能ですが、UI の API 未接続表示が出た場合は、`VDL_API_PORT` が両者で一致していることを確認してください。
 
 詳細は [`web/README.md`](web/README.md)。
