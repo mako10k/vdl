@@ -911,10 +911,11 @@ class JobQueue:
             cancelled.extend(more)
         return cancelled
 
-    def claim_next(self) -> Optional[Job]:
+    def claim_next(self, *, kinds: set[str] | None = None) -> Optional[Job]:
         """
         Atomically claim highest-priority runnable job.
         Runnable = pending AND (no dependency OR dependency is done).
+        kinds limits ordinary work to the available worker lanes; reload bypasses it.
 
         If a daemon_reload gate is active (pending/running), only that job
         may be claimed — all other work is blocked (implicit global dependency).
@@ -966,14 +967,22 @@ class JobQueue:
                     (gate["id"],),
                 ).fetchone()
             else:
+                if kinds is not None and not kinds:
+                    return None
+                kind_filter = ""
+                params = tuple(sorted(kinds)) if kinds is not None else ()
+                if kinds is not None:
+                    kind_filter = f"AND j.kind IN ({','.join('?' for _ in params)})"
                 row = conn.execute(
                     f"""
                     SELECT j.* FROM jobs j
                     WHERE j.status = 'pending'
                       AND ({dep_ok})
+                      {kind_filter}
                     ORDER BY j.priority DESC, j.id ASC
                     LIMIT 1
-                    """
+                    """,
+                    params,
                 ).fetchone()
 
             if not row:

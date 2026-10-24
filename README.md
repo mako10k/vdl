@@ -81,7 +81,7 @@ vdl registry similar 2                 # alias
 ```
 
 デーモンは **ジョブ投入時に自動起動**し、**キューが空のまま一定時間（既定 60 秒）で自動終了**します。  
-実行可能なジョブは **最大 3 並列**（`VDL_DAEMON_WORKERS`）で処理します。優先度の高い download から claim されます。
+実行可能なジョブは **既定で最大 4 並列**（`VDL_DAEMON_WORKERS` / `--workers`、最小2）で処理します。1枠は埋め込み・DEDUP・変換・シーン検出などの後処理専用、残りはダウンロード専用です（既定はダウンロード3＋後処理1）。空いた専用枠を他の種類には貸し出しません。各枠内では優先度順に実行し、依存ジョブの正常完了を待ちます。daemon_reload は全枠の実行終了を待って実行します。
 
 ### スーパーバイザ
 
@@ -112,7 +112,7 @@ export VDL_SUPERVISOR_IDLE_SEC=120
 # アイドル秒数（0=自動終了しない）
 export VDL_DAEMON_IDLE_SEC=120
 # 並列ワーカー数
-export VDL_DAEMON_WORKERS=3
+export VDL_DAEMON_WORKERS=4
 # ジョブ失敗時の最大試行回数（既定 3 = 初回+自動リトライ2回）。超過後は依存後続を自動キャンセル
 export VDL_JOB_MAX_ATTEMPTS=3
 # 終了ジョブ (done/failed/cancelled) をアーカイブするまでの分数（既定 60）
@@ -130,7 +130,7 @@ export VDL_LIST_LIMIT=30
 # 自動起動したくないとき
 vdl get URL --no-daemon
 vdl daemon start   # 手動
-vdl daemon run --workers 3 --idle 60
+vdl daemon run --workers 4 --idle 60
 ```
 
 ### CLI マップ

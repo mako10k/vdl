@@ -36,12 +36,12 @@ def test_claim_only_reload_while_gate_pending(tmp_path: Path) -> None:
     gate = q.ensure_daemon_reload_gate(
         reason="test", fingerprint="fp", priority=PRIORITY_DAEMON_RELOAD
     )
-    claimed = q.claim_next()
+    claimed = q.claim_next(kinds={JobKind.EMBED.value})
     assert claimed is not None
     assert claimed.id == gate.id
     assert claimed.kind == JobKind.DAEMON_RELOAD.value
     # while running reload, nothing else claimable
-    assert q.claim_next() is None
+    assert q.claim_next(kinds={JobKind.DOWNLOAD.value}) is None
 
 
 def test_after_reload_done_other_jobs_run(tmp_path: Path) -> None:

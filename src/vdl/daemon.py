@@ -140,7 +140,12 @@ def run_forever(
     max_workers = int(
         workers if workers is not None else getattr(config, "daemon_workers", DAEMON_WORKERS)
     )
-    max_workers = max(1, max_workers)
+    max_workers = max(2, max_workers)
+    download_workers = max_workers - 1
+    processing_kinds = {
+        kind.value for kind in JobKind
+        if kind not in {JobKind.DOWNLOAD, JobKind.DAEMON_RELOAD}
+    }
 
     logger = _setup_logging(
         config.daemon_log_path if (not foreground or write_pid_file) else None,
@@ -307,7 +312,16 @@ def run_forever(
                     # When reload pending, claim only after idle workers
                     if reload_gate and futures:
                         break
-                    job = queue.claim_next()
+                    downloads_active = sum(
+                        j.kind == JobKind.DOWNLOAD.value for j in futures.values()
+                    )
+                    processing_active = len(futures) - downloads_active
+                    kinds = set()
+                    if downloads_active < download_workers:
+                        kinds.add(JobKind.DOWNLOAD.value)
+                    if processing_active < 1:
+                        kinds.update(processing_kinds)
+                    job = queue.claim_next(kinds=kinds)
                     if not job:
                         break
                     claimed_any = True
@@ -413,7 +427,7 @@ def start_background(
         "--idle",
         str(idle_sec),
         "--workers",
-        str(max(1, workers)),
+        str(max(2, workers)),
     ]
     logf = open(config.daemon_log_path, "a", encoding="utf-8")
     proc = subprocess.Popen(

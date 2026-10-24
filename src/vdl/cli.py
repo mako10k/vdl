@@ -628,7 +628,7 @@ def _auto_start_daemon(config: Config) -> None:
             console.print("[dim]worker will start when supervisor sees queue work[/dim]")
     else:
         idle = getattr(config, "daemon_idle_sec", 60)
-        workers = getattr(config, "daemon_workers", 3)
+        workers = getattr(config, "daemon_workers", 4)
         if started:
             console.print(
                 f"[cyan]daemon auto-started[/cyan] pid={pid} "
@@ -929,7 +929,7 @@ def daemon_group() -> None:
     "--workers",
     type=int,
     default=None,
-    help="並列ジョブ数 (default: VDL_DAEMON_WORKERS または 3)",
+    help="総枠数 (最小2、後処理1＋残りDL、default: VDL_DAEMON_WORKERS または 4)",
 )
 @click.pass_context
 def daemon_run(

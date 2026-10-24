@@ -6,13 +6,15 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from vdl.config import Config
 from vdl.daemon import run_forever
 from vdl.queue import JobKind, JobQueue
 
 
 def test_parallel_claims_three_independent_jobs(tmp_path: Path, monkeypatch) -> None:
-    """Three independent downloads should run concurrently (active <= workers)."""
+    """Downloads run concurrently within their two dedicated slots."""
     cfg = Config(home=tmp_path / "home")
     cfg.ensure_dirs()
     q = JobQueue(cfg.db_path)
@@ -26,15 +28,12 @@ def test_parallel_claims_three_independent_jobs(tmp_path: Path, monkeypatch) -> 
     active = 0
     max_active = 0
     lock = threading.Lock()
-    started = threading.Event()
 
     def fake_run_job(config, job):
         nonlocal active, max_active
         with lock:
             active += 1
             max_active = max(max_active, active)
-            if active >= 2:
-                started.set()
         time.sleep(0.35)
         with lock:
             active -= 1
@@ -42,7 +41,6 @@ def test_parallel_claims_three_independent_jobs(tmp_path: Path, monkeypatch) -> 
 
     monkeypatch.setattr("vdl.daemon.run_job", fake_run_job)
 
-    t0 = time.time()
     run_forever(
         cfg,
         poll_interval=0.05,
@@ -51,10 +49,52 @@ def test_parallel_claims_three_independent_jobs(tmp_path: Path, monkeypatch) -> 
         idle_sec=0.3,
         workers=3,
     )
-    elapsed = time.time() - t0
 
     jobs = q.list_jobs(limit=10)
     assert all(j.status == "done" for j in jobs)
-    # sequential would be ~1.05s; parallel ~0.35s + overhead
-    assert max_active >= 2, f"expected concurrency, max_active={max_active}"
-    assert elapsed < 1.2
+    assert max_active == 2
+
+
+@pytest.mark.parametrize("workers", [1, 3, 4])
+@pytest.mark.parametrize("saturated_kind", [JobKind.DOWNLOAD, JobKind.EMBED])
+def test_reserved_lanes_and_dependencies(tmp_path, monkeypatch, workers, saturated_kind):
+    cfg = Config(home=tmp_path / "home")
+    cfg.daemon_auto_reload = False
+    q = JobQueue(cfg.db_path)
+    download_slots = max(2, workers) - 1
+    processing_started = threading.Event()
+    download_started = threading.Event()
+    lock = threading.Lock()
+    active = {"download": 0, "processing": 0}
+    maxima = active.copy()
+    # Fill either lane with a backlog. Both must still make progress.
+    for _ in range(4):
+        q.enqueue(saturated_kind, priority=1000)
+    parent = q.enqueue(JobKind.DOWNLOAD, priority=100)
+    child = q.enqueue(JobKind.DEDUP, priority=5000, depends_on_job_id=parent.id)
+    q.enqueue(JobKind.EMBED, priority=20)
+
+    def fake_run_job(config, job):
+        lane = "download" if job.kind == "download" else "processing"
+        if job.id == child.id:
+            assert q.get(parent.id).status == "done"
+        with lock:
+            active[lane] += 1
+            maxima[lane] = max(maxima[lane], active[lane])
+        if lane == "download":
+            download_started.set()
+            assert processing_started.wait(3), "processing starved by downloads"
+        else:
+            processing_started.set()
+            assert download_started.wait(3), "downloads starved by processing"
+        time.sleep(0.02)
+        with lock:
+            active[lane] -= 1
+        return {}
+
+    monkeypatch.setattr("vdl.daemon.run_job", fake_run_job)
+    run_forever(cfg, workers=workers, poll_interval=0.01,
+                foreground=False, idle_sec=0.02)
+    assert all(j.status == "done" for j in q.list_jobs(limit=20))
+    assert 1 <= maxima["download"] <= download_slots
+    assert maxima["processing"] == 1

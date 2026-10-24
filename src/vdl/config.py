@@ -50,8 +50,8 @@ SEARCH_MAX_PER_DOMAIN = max(0, int(os.environ.get("VDL_SEARCH_MAX_PER_DOMAIN", "
 FRAMES_PER_SCENE = int(os.environ.get("VDL_FRAMES_PER_SCENE", "5"))
 # Background daemon exits after this many idle seconds with empty queue (0 = never).
 DAEMON_IDLE_SEC = float(os.environ.get("VDL_DAEMON_IDLE_SEC", "60"))
-# Max concurrent jobs in the daemon worker pool.
-DAEMON_WORKERS = int(os.environ.get("VDL_DAEMON_WORKERS", "3"))
+# Total worker slots: one processing slot, remainder download-only (minimum 2).
+DAEMON_WORKERS = int(os.environ.get("VDL_DAEMON_WORKERS", "4"))
 # Auto-enqueue daemon_reload when package code mtime changes (job-boundary only).
 DAEMON_AUTO_RELOAD = os.environ.get("VDL_DAEMON_AUTO_RELOAD", "1").strip() not in {
     "0",
@@ -101,7 +101,7 @@ class Config:
         self.supervisor_pid_path = self.home / SUPERVISOR_PID_NAME
         self.supervisor_log_path = self.home / SUPERVISOR_LOG_NAME
         self.daemon_idle_sec = DAEMON_IDLE_SEC
-        self.daemon_workers = max(1, DAEMON_WORKERS)
+        self.daemon_workers = max(2, DAEMON_WORKERS)
         self.daemon_auto_reload = DAEMON_AUTO_RELOAD
         self.supervisor_idle_sec = SUPERVISOR_IDLE_SEC
         self.supervisor_enabled = SUPERVISOR_ENABLED

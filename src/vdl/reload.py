@@ -80,7 +80,7 @@ def reexec_daemon(config: Config, *, idle_sec: float, workers: int) -> None:
         "--idle",
         str(idle_sec),
         "--workers",
-        str(max(1, workers)),
+        str(max(2, workers)),
     ]
     # Ensure cwd-independent; env inherits (VDL_* etc.)
     os.execv(sys.executable, argv)
