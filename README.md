@@ -233,3 +233,15 @@ npm run dev:all
 `npm run dev:all` は起動した API と UI を一緒に停止します。API がすでに動いていれば再利用し、停止しません。個別起動も可能ですが、UI の API 未接続表示が出た場合は、`VDL_API_PORT` が両者で一致していることを確認してください。
 
 詳細は [`web/README.md`](web/README.md)。
+
+証明書の期限切れ・自己署名などで取得できないURLには、対象を確認して `--insecure` を指定できます。
+この指定は証明書検証全体（接続先の確認を含む）を無効にし、HTML候補取得、直接DL、HLSのプレイリスト・セグメント・鍵取得に適用されます。
+指定はジョブに保存され、ワーカーでの実行・再試行にも引き継ぎます。省略時は検証を有効にします。
+
+```bash
+vdl get 'https://example.com/video.mp4' --insecure
+vdl get 'https://example.com/playlist.m3u8' --insecure --sync
+vdl candidates 'https://example.com/page' --insecure --enqueue -y
+```
+
+APIでは `/api/enqueue`、`/api/enqueue/batch`、`/api/candidates` のJSONに `"insecure": true` を指定できます（既定は `false`）。

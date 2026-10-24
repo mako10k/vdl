@@ -41,6 +41,7 @@ def enqueue_download(
     select_all: bool = False,
     timeout: float = 60.0,
     no_index: bool = False,
+    insecure: bool = False,
     priority: int | None = None,
 ) -> Job:
     from vdl.config import PRIORITY_DOWNLOAD
@@ -57,6 +58,7 @@ def enqueue_download(
             "select_all": select_all,
             "timeout": timeout,
             "no_index": no_index,
+            "insecure": insecure,
         },
     )
 
@@ -236,6 +238,7 @@ def _run_download(config: Config, queue: JobQueue, job: Job) -> dict[str, Any]:
         force=bool(p.get("force")),
         headers=p.get("headers") or {},
         timeout=float(p.get("timeout", 60.0)),
+        insecure=bool(p.get("insecure", False)),
         on_progress=on_progress,
         on_phase=on_phase,
     ) as svc:

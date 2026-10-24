@@ -91,6 +91,7 @@ class EnqueueBody(BaseModel):
     quality: str = "best"
     force: bool = False
     no_index: bool = False
+    insecure: bool = False
     headers: dict[str, str] = Field(default_factory=dict)
 
 
@@ -99,10 +100,12 @@ class EnqueueManyBody(BaseModel):
     quality: str = "best"
     force: bool = False
     no_index: bool = False
+    insecure: bool = False
     headers: dict[str, str] = Field(default_factory=dict)
 
 
 class CandidatesBody(BaseModel):
+    insecure: bool = False
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
 
@@ -282,14 +285,16 @@ def queue_cancel(job_id: int) -> dict[str, Any]:
     return _job_dict(j)
 
 
-def _reject_if_html_page(url: str, headers: dict[str, str] | None = None) -> None:
+def _reject_if_html_page(
+    url: str, headers: dict[str, str] | None = None, *, insecure: bool = False
+) -> None:
     """Refuse to queue bare HTML pages as download jobs (use /api/candidates)."""
     import httpx
 
     from vdl.classifier import ResourceKind, ResourceProbe
 
     try:
-        with httpx.Client(follow_redirects=True, timeout=20.0) as client:
+        with httpx.Client(follow_redirects=True, timeout=20.0, verify=not insecure) as client:
             kind = ResourceProbe(client, timeout=20.0).probe(
                 url, extra_headers=headers or None
             ).kind
@@ -314,7 +319,7 @@ def _reject_if_html_page(url: str, headers: dict[str, str] | None = None) -> Non
 def enqueue(body: EnqueueBody) -> dict[str, Any]:
     cfg = get_config()
     url = body.url.strip()
-    _reject_if_html_page(url, body.headers)
+    _reject_if_html_page(url, body.headers, insecure=body.insecure)
     q = JobQueue(cfg.db_path)
     job = enqueue_download(
         q,
@@ -323,6 +328,7 @@ def enqueue(body: EnqueueBody) -> dict[str, Any]:
         force=body.force,
         headers=body.headers,
         no_index=body.no_index,
+        insecure=body.insecure,
     )
     role, pid, started = ensure_runtime(cfg)
     return {
@@ -342,7 +348,7 @@ def enqueue_batch(body: EnqueueManyBody) -> dict[str, Any]:
         if not u:
             continue
         try:
-            _reject_if_html_page(u, body.headers)
+            _reject_if_html_page(u, body.headers, insecure=body.insecure)
         except HTTPException:
             skipped_html.append(u)
             continue
@@ -353,6 +359,7 @@ def enqueue_batch(body: EnqueueManyBody) -> dict[str, Any]:
             force=body.force,
             headers=body.headers,
             no_index=body.no_index,
+            insecure=body.insecure,
         )
         jobs.append(_job_dict(job))
     if not jobs and skipped_html:
@@ -375,7 +382,7 @@ def enqueue_batch(body: EnqueueManyBody) -> dict[str, Any]:
 @app.post("/api/candidates")
 def candidates(body: CandidatesBody) -> dict[str, Any]:
     cfg = get_config()
-    with DownloadService(cfg, headers=body.headers) as svc:
+    with DownloadService(cfg, headers=body.headers, insecure=body.insecure) as svc:
         try:
             page_url, rows = svc.fetch_html_candidates(body.url.strip())
         except Exception as e:

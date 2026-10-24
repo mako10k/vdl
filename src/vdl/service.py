@@ -122,6 +122,7 @@ class DownloadService:
         force: bool = False,
         headers: dict[str, str] | None = None,
         timeout: float = 60.0,
+        insecure: bool = False,
         on_progress: ProgressCallback | None = None,
         on_phase: Callable[[str, float | None], None] | None = None,
     ) -> None:
@@ -132,11 +133,13 @@ class DownloadService:
         self.force = force
         self.headers = headers or {}
         self.timeout = timeout
+        self.insecure = insecure
         # on_progress(written, total) for direct file downloads
         self.on_progress = on_progress
         # on_phase(message, pct_or_None) for multi-step downloads (probe, hls, …)
         self.on_phase = on_phase
         self.client = httpx.Client(
+            verify=not insecure,
             follow_redirects=True,
             timeout=timeout,
             headers={"User-Agent": "Mozilla/5.0 (compatible; vdl/0.1)"},
@@ -545,6 +548,7 @@ class DownloadService:
                 filename=title,
                 headers=self.headers or None,
                 duration_hint=dur,
+                insecure=self.insecure,
                 on_progress=_hls_prog,
             )
             self._phase("hashing", 95.0)

@@ -293,6 +293,7 @@ def main(ctx: click.Context, home_dir: Optional[Path]) -> None:
     is_flag=True,
     help="ジョブ投入後にデーモンを自動起動しない",
 )
+@click.option("--insecure", is_flag=True, help="TLS証明書の検証を無効化（期限切れ・自己署名などを許可）")
 @click.pass_context
 def get_cmd(
     ctx: click.Context,
@@ -307,6 +308,7 @@ def get_cmd(
     sync: bool,
     no_index: bool,
     no_daemon: bool,
+    insecure: bool,
 ) -> None:
     """
     URL を処理する。
@@ -324,7 +326,7 @@ def get_cmd(
     # Probe to branch HTML vs media
     kind = None
     try:
-        with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+        with httpx.Client(follow_redirects=True, timeout=timeout, verify=not insecure) as client:
             probe = ResourceProbe(client, timeout=timeout)
             classified = probe.probe(url, extra_headers=headers or None)
             kind = classified.kind
@@ -344,6 +346,7 @@ def get_cmd(
             quality=quality,
             force=force,
             timeout=timeout,
+            insecure=insecure,
             auto_yes=auto_yes,
             select_all=select_all,
             do_enqueue=do_enqueue,
@@ -361,6 +364,7 @@ def get_cmd(
             force=force,
             headers=headers,
             timeout=timeout,
+            insecure=insecure,
         ) as svc:
             results = svc.process_url(
                 url,
@@ -393,6 +397,7 @@ def get_cmd(
         auto_yes=False,
         select_all=False,
         timeout=timeout,
+        insecure=insecure,
         no_index=no_index,
     )
     console.print(f"[green]queued[/green] job_id={job.id} kind=download priority={job.priority}")
@@ -420,6 +425,7 @@ def _run_html_get(
     do_enqueue: bool,
     no_index: bool,
     no_daemon: bool,
+    insecure: bool,
     sync: bool,
 ) -> None:
     """List HTML media candidates; optionally enqueue/sync-download them."""
@@ -431,6 +437,7 @@ def _run_html_get(
         force=force,
         headers=headers,
         timeout=timeout,
+        insecure=insecure,
     ) as svc:
         try:
             page_url, rows = svc.fetch_html_candidates(url)
@@ -520,6 +527,7 @@ def _run_html_get(
                 force=force,
                 headers=headers,
                 timeout=timeout,
+                insecure=insecure,
                 no_index=no_index,
             )
             job_ids.append(job.id)
@@ -568,6 +576,7 @@ def _run_html_get(
 @click.option("--timeout", default=60.0, show_default=True, type=float)
 @click.option("--no-index", is_flag=True)
 @click.option("--no-daemon", is_flag=True)
+@click.option("--insecure", is_flag=True, help="TLS証明書の検証を無効化")
 @click.pass_context
 def candidates_cmd(
     ctx: click.Context,
@@ -581,6 +590,7 @@ def candidates_cmd(
     timeout: float,
     no_index: bool,
     no_daemon: bool,
+    insecure: bool,
 ) -> None:
     """HTML ページから動画 / m3u8 候補を抽出して表示する。"""
     config: Config = ctx.obj["config"]
@@ -592,6 +602,7 @@ def candidates_cmd(
         quality=quality,
         force=force,
         timeout=timeout,
+        insecure=insecure,
         auto_yes=auto_yes,
         select_all=select_all,
         do_enqueue=do_enqueue,

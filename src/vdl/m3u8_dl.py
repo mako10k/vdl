@@ -256,6 +256,7 @@ def download_m3u8_ffmpeg(
     filename: str | None = None,
     headers: dict[str, str] | None = None,
     ffmpeg_bin: str = "ffmpeg",
+    insecure: bool = False,
     duration_hint: float | None = None,
     on_progress: FFmpegProgressCb | None = None,
 ) -> tuple[Path, int]:
@@ -293,6 +294,8 @@ def download_m3u8_ffmpeg(
             "-progress",
             "pipe:1",
             *header_args,
+            "-tls_verify",
+            "0" if insecure else "1",
             "-i",
             media_playlist_url,
             "-c",
