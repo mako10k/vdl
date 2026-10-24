@@ -140,3 +140,37 @@ def test_claim_after_archived_success_parent(tmp_path: Path) -> None:
         )
     c = q.claim_next()
     assert c is not None and c.id == b.id
+
+
+
+def test_old_running_jobs_survive_large_newer_backlog(tmp_path):
+    q = JobQueue(tmp_path / "r.db")
+    running = q.enqueue(JobKind.DOWNLOAD, priority=100)
+    q.claim_next()
+    with q._conn() as conn:
+        conn.executemany(
+            "INSERT INTO jobs(kind, priority, status, created_at, updated_at) "
+            "VALUES ('embed', 20, 'pending', ?, ?)",
+            [(running.created_at, running.created_at)] * 700,
+        )
+    for options in ({}, {"include_all_done": True}, {"include_archived": True}, {"kind": "download"}):
+        rows, _ = q.list_jobs_display(limit=30, **options)
+        assert rows[0].id == running.id
+        assert rows[0].status == "running"
+    pending, _ = q.list_jobs_display(status="pending", limit=30)
+    assert all(row.status == "pending" for row in pending)
+
+
+def test_all_running_jobs_precede_pending_and_history(tmp_path):
+    q = JobQueue(tmp_path / "r.db")
+    a = q.enqueue(JobKind.DOWNLOAD, priority=100)
+    b = q.enqueue(JobKind.DOWNLOAD, priority=100)
+    q.claim_next()
+    q.claim_next()
+    q.enqueue(JobKind.EMBED, priority=20)
+    done = q.enqueue(JobKind.DOWNLOAD, priority=100)
+    q.mark_done(done.id)
+    for options in ({}, {"include_all_done": True}):
+        rows, _ = q.list_jobs_display(limit=4, **options)
+        assert {row.id for row in rows[:2]} == {a.id, b.id}
+        assert all(row.status == "running" for row in rows[:2])

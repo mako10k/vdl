@@ -537,27 +537,27 @@ class JobQueue:
             else float(cancelled_within_minutes)
         )
 
-        # Fetch a wider window then filter (simple, portable).
+        # Prioritize running jobs in SQL, before applying the fetch window.
+        # Otherwise a large newer backlog can hide even active downloads.
         fetch_n = max(limit * 20, 200)
-        if status == "archived" or include_archived:
-            raw = self.list_jobs(status=status, kind=kind, limit=fetch_n)
-        elif status:
-            raw = self.list_jobs(status=status, kind=kind, limit=fetch_n)
-        else:
-            # exclude archived from default pull
-            with self._conn() as conn:
-                clauses = ["status != 'archived'"]
-                args: list[Any] = []
-                if kind:
-                    clauses.append("kind = ?")
-                    args.append(kind)
-                args.append(fetch_n)
-                rows_db = conn.execute(
-                    f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} "
-                    f"ORDER BY id DESC LIMIT ?",
-                    args,
-                ).fetchall()
-                raw = [self._row(r) for r in rows_db]
+        with self._conn() as conn:
+            clauses: list[str] = []
+            args: list[Any] = []
+            if status:
+                clauses.append("status = ?")
+                args.append(status)
+            elif not include_archived:
+                clauses.append("status != 'archived'")
+            if kind:
+                clauses.append("kind = ?")
+                args.append(kind)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            args.append(fetch_n)
+            raw = [self._row(r) for r in conn.execute(
+                f"SELECT * FROM jobs{where} "
+                "ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, "
+                "id DESC LIMIT ?", args,
+            ).fetchall()]
 
         if include_all_done or status in (
             "done",
