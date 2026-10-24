@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "vdl",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Detect in-page video/m3u8, enqueue to local vdl, open Web console.",
   "action": {
     "default_title": "vdl",

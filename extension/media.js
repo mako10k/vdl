@@ -98,3 +98,26 @@ export function absUrl(href, base) {
 export function hasMediaExtensionHint(url) {
   return EXT_RE.test(url || '');
 }
+
+/** HTTP fragments do not identify a different downloaded resource.
+ * Preserve query parameters (including signatures), path case, and scheme.
+ */
+export function mediaUrlKey(raw) {
+  try {
+    const url = new URL(raw.trim());
+    url.hash = '';
+    return url.href;
+  } catch {
+    return String(raw || '').trim();
+  }
+}
+
+export function uniqueMediaItems(items = []) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = mediaUrlKey(item.url);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}

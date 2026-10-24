@@ -1,4 +1,5 @@
 import { getSettings } from './api.js';
+import { uniqueMediaItems } from './media.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -73,7 +74,7 @@ function renderJobs(queue) {
 }
 
 function renderDetected(items) {
-  detected = items || [];
+  detected = uniqueMediaItems(items || []);
   $('detectMeta').textContent = detected.length ? `${detected.length} 件` : '';
   const list = $('detectList');
   $('btnEnqueueDetected').disabled = !detected.length;
@@ -114,7 +115,7 @@ function candidateStateLabel(c) {
 
 function renderCandidates(data) {
   const section = $('candSection');
-  candidates = data?.candidates || [];
+  candidates = uniqueMediaItems(data?.candidates || []);
   if (!candidates.length) {
     section.classList.add('hidden');
     return;
@@ -236,10 +237,9 @@ async function onEnqueueDetected() {
       type: 'enqueueBatch',
       urls,
       quality: $('quality').value,
-      openQueue: true,
     });
     if (!res.ok) throw new Error(res.error || 'batch failed');
-    showMsg(`enqueued ${(res.result.jobs || []).length} job(s) → Console キュー`);
+    showMsg(`enqueued ${(res.result.jobs || []).length} job(s)`);
     await refreshStatus();
   } catch (e) {
     showErr(e.message || String(e));
@@ -258,7 +258,6 @@ async function onEnqueue() {
       type: 'enqueue',
       url,
       quality: $('quality').value,
-      openQueue: true,
     });
     if (!res.ok) throw new Error(res.error || 'enqueue failed');
     const id = res.result?.job?.id;
@@ -300,7 +299,6 @@ async function onEnqueueSelected() {
       type: 'enqueueBatch',
       urls,
       quality: $('quality').value,
-      openQueue: true,
     });
     if (!res.ok) throw new Error(res.error || 'batch failed');
     showMsg(`enqueued ${(res.result.jobs || []).length} job(s)`);

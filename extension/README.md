@@ -13,7 +13,7 @@
 | **ポップアップ** | 検出一覧 → 選択して DL 投入 / **Console で開く** |
 | **右クリック** | 検出 / Console 連携 / Enqueue / サーバー側スクレイプ |
 | **Web 連携** | `POST /api/bridge/push` → Console が `?vdl_bridge=TOKEN&tab=candidates` で取り込み |
-| **投入後** | Console の **Queue** タブを自動で開く |
+| **投入後** | ポップアップ内に結果を表示。Web画面は **Console で開く** / **Console キュー** で明示的に開く |
 
 ## インストール
 
@@ -32,7 +32,7 @@
 
 1. 動画サイトで再生を開始（HLS が流れるのを待つ）  
 2. 拡張アイコンのバッジがカウントアップ  
-3. ポップアップ → **選択を DL 投入**（Queue が開く）  
+3. ポップアップ → **選択を DL 投入**（Web画面は自動で開きません）
    または **Console で開く** → Candidates タブで確認して Enqueue  
 
 ## 権限
@@ -63,3 +63,13 @@ extension/
 - レジストリ登録済み・キュー中は **既定チェック OFF**（`selected_by_default`）  
 - `chrome://` 等の制限ページでは検出不可  
 - blob: / MSE のみのプレイヤーは URL が取れない場合あり（ネットワークに m3u8 が出れば捕捉）
+
+## 重複除去
+
+検出一覧・サーバー候補・一括投入では同一URLを事前にまとめます。
+フラグメント（`#...`）、ホスト名の大小文字、標準ポート表記の違いも同一として扱います。
+クエリ文字列・パスの大小文字・HTTP/HTTPSの違いは保持します。
+
+Edgeでは `edge://extensions` から同じ手順で読み込み・再読み込みできます。
+
+動作テスト: `node --experimental-default-type=module --test extension/tests/behavior.test.mjs`

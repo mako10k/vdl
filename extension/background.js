@@ -2,7 +2,7 @@
  * vdl service worker — media detection, context menus, enqueue, UI bridge.
  */
 import { api, getSettings } from './api.js';
-import { classifyFromContentType, classifyMediaUrl, rankKind } from './media.js';
+import { classifyFromContentType, classifyMediaUrl, rankKind, mediaUrlKey, uniqueMediaItems } from './media.js';
 
 const MENU = {
   PAGE: 'vdl-enqueue-page',
@@ -44,9 +44,10 @@ function addMediaItems(tabId, items, pageUrl) {
     if (!url) continue;
     const kind = raw.kind || classifyMediaUrl(url);
     if (!kind) continue;
-    const prev = map.get(url);
+    const key = mediaUrlKey(url);
+    const prev = map.get(key);
     if (!prev) {
-      map.set(url, {
+      map.set(key, {
         url,
         kind,
         source: raw.source || 'unknown',
@@ -147,7 +148,7 @@ chrome.runtime.onInstalled.addListener(() => {
     });
     chrome.contextMenus.create({
       id: MENU.PAGE,
-      title: 'vdl: このページの候補を Console へ',
+      title: 'vdl: このページの候補を抽出',
       contexts: ['page'],
     });
     chrome.contextMenus.create({
@@ -215,41 +216,17 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
           /* ignore */
         }
         if (listTabMedia(tabId).length) {
-          const r = await openConsoleWithMedia(tabId, url, { tab: 'candidates' });
-          notify('vdl', `検出 ${r.count} 件 → Console`);
+          notify('vdl', `検出 ${listTabMedia(tabId).length} 件 — ポップアップで選択`);
           return;
         }
       }
       if (url) {
         const r = await api.candidates(url);
-        const n = r.count ?? (r.candidates || []).length;
+        const candidates = uniqueMediaItems(r.candidates || []);
         await chrome.storage.session.set({
-          lastCandidates: {
-            page_url: r.page_url || url,
-            candidates: r.candidates || [],
-            at: Date.now(),
-          },
+          lastCandidates: { page_url: r.page_url || url, candidates, at: Date.now() },
         });
-        if (n) {
-          const settings = await getSettings();
-          const push = await api.bridgePush({
-            page_url: r.page_url || url,
-            items: (r.candidates || []).map((c) => ({
-              url: c.url,
-              kind: c.kind,
-              source: c.source || 'scrape',
-              title: c.title,
-            })),
-            tab: 'candidates',
-            note: 'page menu scrape',
-          });
-          await chrome.tabs.create({
-            url: `${settings.uiBase}/?${push.ui_query || `vdl_bridge=${push.token}&tab=candidates`}`,
-          });
-          notify('vdl candidates', `${n} 件 → Console`);
-        } else {
-          notify('vdl', '候補なし — 再生してから再検出');
-        }
+        notify('vdl candidates', `${candidates.length} 件 — ポップアップで選択`);
       }
       return;
     }
@@ -269,7 +246,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       await chrome.storage.session.set({
         lastCandidates: {
           page_url: r.page_url || url,
-          candidates: r.candidates || [],
+          candidates: uniqueMediaItems(r.candidates || []),
           at: Date.now(),
         },
       });
@@ -380,22 +357,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (msg?.type === 'enqueue') {
         const r = await enqueueUrl(msg.url, { quality: msg.quality });
-        if (msg.openQueue) {
-          const settings = await getSettings();
-          await chrome.tabs.create({ url: `${settings.uiBase}/?tab=queue` });
-        }
         sendResponse({ ok: true, result: r });
         return;
       }
       if (msg?.type === 'enqueueBatch') {
         const settings = await getSettings();
-        const r = await api.enqueueBatch(msg.urls || [], {
+        const r = await api.enqueueBatch(uniqueMediaItems((msg.urls || []).map((url) => ({ url }))).map((m) => m.url), {
           quality: msg.quality || settings.quality,
         });
         notify('vdl batch', `enqueued ${(r.jobs || []).length} job(s)`);
-        if (msg.openQueue !== false) {
-          await chrome.tabs.create({ url: `${settings.uiBase}/?tab=queue` });
-        }
         sendResponse({ ok: true, result: r });
         return;
       }
@@ -404,7 +374,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.session.set({
           lastCandidates: {
             page_url: r.page_url || msg.url,
-            candidates: r.candidates || [],
+            candidates: uniqueMediaItems(r.candidates || []),
             at: Date.now(),
           },
         });
