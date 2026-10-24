@@ -1,5 +1,5 @@
 import { getSettings } from './api.js';
-import { uniqueMediaItems } from './media.js';
+import { mediaUrlKey, uniqueMediaItems } from './media.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -9,6 +9,7 @@ let pageUrl = '';
 let detected = [];
 /** @type {Array<object>} */
 let candidates = [];
+let submitted = new Set();
 
 function showMsg(text) {
   const el = $('msg');
@@ -74,7 +75,7 @@ function renderJobs(queue) {
 }
 
 function renderDetected(items) {
-  detected = uniqueMediaItems(items || []);
+  detected = uniqueMediaItems(items || []).filter((m) => !submitted.has(mediaUrlKey(m.url)) && !m.queued && !m.downloaded);
   $('detectMeta').textContent = detected.length ? `${detected.length} 件` : '';
   const list = $('detectList');
   $('btnEnqueueDetected').disabled = !detected.length;
@@ -115,7 +116,7 @@ function candidateStateLabel(c) {
 
 function renderCandidates(data) {
   const section = $('candSection');
-  candidates = uniqueMediaItems(data?.candidates || []);
+  candidates = uniqueMediaItems(data?.candidates || []).filter((m) => !submitted.has(mediaUrlKey(m.url)) && !m.queued && !m.downloaded);
   if (!candidates.length) {
     section.classList.add('hidden');
     return;
@@ -144,7 +145,17 @@ function renderCandidates(data) {
     .join('');
 }
 
+async function refreshCapture() {
+  const state = await send({ type: 'getCaptureState' });
+  if (!state.ok) return;
+  submitted = new Set(state.submitted || []);
+  $('autoCapture').checked = state.enabled;
+  renderCandidates({ candidates });
+  await loadDetected();
+}
+
 async function refreshStatus() {
+  await refreshCapture();
   const res = await send({ type: 'status' });
   const conn = $('conn');
   if (!res.ok || !res.health) {
@@ -339,6 +350,15 @@ async function boot() {
     chrome.runtime.openOptionsPage();
   });
 
+  $('autoCapture').addEventListener('change', async () => {
+    const res = await send({ type: 'setAutoCapture', enabled: $('autoCapture').checked });
+    if (!res.ok) showErr(res.error);
+    await refreshCapture();
+  });
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'captureChanged') void refreshCapture();
+  });
+  await refreshCapture();
   $('btnDetect').addEventListener('click', () => void onDetect());
   $('btnClearDetect').addEventListener('click', () => void onClearDetect());
   $('btnOpenConsole').addEventListener('click', () => void onOpenConsole());

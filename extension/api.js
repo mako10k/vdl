@@ -25,6 +25,7 @@ async function req(path, init = {}) {
   let res;
   try {
     res = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
       ...init,
       headers: {
         'Content-Type': 'application/json',
@@ -54,6 +55,9 @@ async function req(path, init = {}) {
 }
 
 export const api = {
+  submitted: (urls) => req('/api/submitted-urls', {
+    method: 'POST', body: JSON.stringify({ urls }),
+  }),
   health: () => req('/api/health'),
   status: () => req('/api/status'),
   queue: (params = {}) => {

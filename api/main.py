@@ -315,6 +315,18 @@ def _reject_if_html_page(
         )
 
 
+class SubmittedUrlsBody(BaseModel):
+    urls: list[str] = Field(max_length=1000)
+
+
+@app.post("/api/submitted-urls")
+def submitted_urls(body: SubmittedUrlsBody) -> dict[str, Any]:
+    from vdl.util import normalize_url
+
+    known = JobQueue(get_config().db_path).submitted_download_urls()
+    return {"urls": [url for url in body.urls if normalize_url(url) in known]}
+
+
 @app.post("/api/enqueue")
 def enqueue(body: EnqueueBody) -> dict[str, Any]:
     cfg = get_config()

@@ -2,7 +2,8 @@
  * vdl service worker — media detection, context menus, enqueue, UI bridge.
  */
 import { api, getSettings } from './api.js';
-import { classifyFromContentType, classifyMediaUrl, rankKind, mediaUrlKey, uniqueMediaItems } from './media.js';
+import { Capture } from './capture.js';
+import { classifyFromContentType, classifyMediaUrl, rankKind } from './media.js';
 
 const MENU = {
   PAGE: 'vdl-enqueue-page',
@@ -13,8 +14,19 @@ const MENU = {
   OPEN_UI: 'vdl-open-console',
 };
 
-/** @type {Map<number, Map<string, object>>} */
-const tabMedia = new Map();
+const capture = new Capture({
+  storage: chrome.storage,
+  check: (urls) => api.submitted(urls),
+  submit: async (urls, quality) => {
+    const settings = await getSettings();
+    return api.enqueueBatch(urls, { quality: quality || settings.quality });
+  },
+  changed: async (tabId) => {
+    await updateBadge(tabId);
+    chrome.runtime.sendMessage({ type: 'captureChanged' }).catch(() => {});
+  },
+  failed: (error) => notify('vdl auto capture', error.message || String(error)),
+});
 
 function notify(title, message) {
   try {
@@ -30,51 +42,15 @@ function notify(title, message) {
   }
 }
 
-function getOrCreateTabMap(tabId) {
-  if (!tabMedia.has(tabId)) tabMedia.set(tabId, new Map());
-  return tabMedia.get(tabId);
-}
-
-function addMediaItems(tabId, items, pageUrl) {
-  if (tabId == null || tabId < 0) return 0;
-  const map = getOrCreateTabMap(tabId);
-  let added = 0;
-  for (const raw of items || []) {
-    const url = (raw.url || '').trim();
-    if (!url) continue;
-    const kind = raw.kind || classifyMediaUrl(url);
-    if (!kind) continue;
-    const key = mediaUrlKey(url);
-    const prev = map.get(key);
-    if (!prev) {
-      map.set(key, {
-        url,
-        kind,
-        source: raw.source || 'unknown',
-        title: raw.title || null,
-        mime: raw.mime || null,
-        pageUrl: pageUrl || raw.pageUrl || null,
-        firstSeen: Date.now(),
-      });
-      added += 1;
-    } else {
-      // upgrade source/kind if better
-      if (rankKind(kind) < rankKind(prev.kind)) prev.kind = kind;
-      if (raw.source && prev.source === 'unknown') prev.source = raw.source;
-      if (raw.title && !prev.title) prev.title = raw.title;
-      if (raw.mime) prev.mime = raw.mime;
-    }
-  }
-  if (added) void updateBadge(tabId);
-  return added;
+async function addMediaItems(tabId, items, pageUrl) {
+  const media = (items || []).map((m) => ({ ...m, kind: m.kind || classifyMediaUrl(m.url) }))
+    .filter((m) => m.kind);
+  await capture.add(tabId, media, pageUrl);
 }
 
 function listTabMedia(tabId) {
-  const map = tabMedia.get(tabId);
-  if (!map) return [];
-  return [...map.values()].sort(
-    (a, b) => rankKind(a.kind) - rankKind(b.kind) || a.url.localeCompare(b.url),
-  );
+  return capture.list(tabId).sort(
+    (a, b) => rankKind(a.kind) - rankKind(b.kind) || a.url.localeCompare(b.url));
 }
 
 async function updateBadge(tabId) {
@@ -95,8 +71,10 @@ async function enqueueUrl(url, { quality } = {}) {
   const settings = await getSettings();
   const q = quality || settings.quality || 'best';
   try {
-    const r = await api.enqueue({ url, quality: q });
+    const batch = await capture.enqueue([url], q);
+    const r = { ...batch, job: batch.jobs?.[0] };
     const jobId = r?.job?.id;
+    if (!jobId) return r;
     const started = r?.runtime?.started ? ' (worker started)' : '';
     notify('vdl queued', `job #${jobId} · ${url.slice(0, 80)}${started}`);
     return r;
@@ -170,16 +148,16 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  tabMedia.delete(tabId);
+  void capture.clear(tabId);
 });
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-  void updateBadge(tabId);
+  void capture.ready.then(() => updateBadge(tabId));
 });
 
 // Network capture (HLS / progressive media)
 chrome.webRequest.onCompleted.addListener(
-  (details) => {
+  async (details) => {
     if (details.tabId < 0) return;
     if (details.method && details.method !== 'GET' && details.method !== 'HEAD') return;
     let mime = null;
@@ -193,7 +171,7 @@ chrome.webRequest.onCompleted.addListener(
     if (!kind) return;
     // skip our own API
     if (/^https?:\/\/(127\.0\.0\.1|localhost):1876[56]\b/i.test(details.url)) return;
-    addMediaItems(
+    await addMediaItems(
       details.tabId,
       [{ url: details.url, kind, source: 'network', mime }],
       details.initiator || null,
@@ -205,13 +183,14 @@ chrome.webRequest.onCompleted.addListener(
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   try {
+    await capture.ready;
     const tabId = tab?.id;
     if (info.menuItemId === MENU.PAGE) {
       const url = tab?.url || info.pageUrl;
       if (tabId != null) {
         try {
           const res = await chrome.tabs.sendMessage(tabId, { type: 'rescan' });
-          if (res?.items) addMediaItems(tabId, res.items, res.pageUrl || url);
+          if (res?.items) await addMediaItems(tabId, res.items, res.pageUrl || url);
         } catch {
           /* ignore */
         }
@@ -222,7 +201,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       }
       if (url) {
         const r = await api.candidates(url);
-        const candidates = uniqueMediaItems(r.candidates || []);
+        const candidates = capture.filter(r.candidates || []);
         await chrome.storage.session.set({
           lastCandidates: { page_url: r.page_url || url, candidates, at: Date.now() },
         });
@@ -246,7 +225,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       await chrome.storage.session.set({
         lastCandidates: {
           page_url: r.page_url || url,
-          candidates: uniqueMediaItems(r.candidates || []),
+          candidates: capture.filter(r.candidates || []),
           at: Date.now(),
         },
       });
@@ -257,7 +236,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       if (tabId == null) return;
       try {
         const res = await chrome.tabs.sendMessage(tabId, { type: 'rescan' });
-        if (res?.items) addMediaItems(tabId, res.items, res.pageUrl || tab.url);
+        if (res?.items) await addMediaItems(tabId, res.items, res.pageUrl || tab.url);
       } catch {
         /* content script may be missing on restricted pages */
       }
@@ -269,7 +248,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       if (tabId == null) return;
       try {
         const res = await chrome.tabs.sendMessage(tabId, { type: 'rescan' });
-        if (res?.items) addMediaItems(tabId, res.items, res.pageUrl || tab.url);
+        if (res?.items) await addMediaItems(tabId, res.items, res.pageUrl || tab.url);
       } catch {
         /* ignore */
       }
@@ -285,16 +264,20 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
+      await capture.ready;
       if (msg?.type === 'mediaFound') {
         const tabId = sender.tab?.id;
         if (tabId != null) {
-          addMediaItems(tabId, msg.items, msg.pageUrl || sender.tab?.url);
+          await addMediaItems(tabId, msg.items, msg.pageUrl || sender.tab?.url);
         }
         sendResponse({ ok: true });
         return;
       }
       if (msg?.type === 'getDetected') {
         const tabId = msg.tabId ?? sender.tab?.id;
+        if (tabId != null) {
+          await capture.checkSubmitted(capture.list(tabId).map((m) => m.url)).catch(() => {});
+        }
         sendResponse({
           ok: true,
           items: tabId != null ? listTabMedia(tabId) : [],
@@ -305,8 +288,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg?.type === 'clearDetected') {
         const tabId = msg.tabId;
         if (tabId != null) {
-          tabMedia.delete(tabId);
-          await updateBadge(tabId);
+          await capture.clear(tabId);
         }
         sendResponse({ ok: true });
         return;
@@ -318,7 +300,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           const res = await chrome.tabs.sendMessage(tabId, { type: 'rescan' });
           items = res?.items || [];
-          addMediaItems(tabId, items, res?.pageUrl);
+          await addMediaItems(tabId, items, res?.pageUrl);
         } catch (e) {
           // try inject content script once
           try {
@@ -328,7 +310,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             });
             const res = await chrome.tabs.sendMessage(tabId, { type: 'rescan' });
             items = res?.items || [];
-            addMediaItems(tabId, items, res?.pageUrl);
+            await addMediaItems(tabId, items, res?.pageUrl);
           } catch (e2) {
             throw new Error(
               `このページでは検出できません: ${e2.message || e.message || e}`,
@@ -362,9 +344,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (msg?.type === 'enqueueBatch') {
         const settings = await getSettings();
-        const r = await api.enqueueBatch(uniqueMediaItems((msg.urls || []).map((url) => ({ url }))).map((m) => m.url), {
-          quality: msg.quality || settings.quality,
-        });
+        const r = await capture.enqueue(msg.urls || [], msg.quality || settings.quality);
         notify('vdl batch', `enqueued ${(r.jobs || []).length} job(s)`);
         sendResponse({ ok: true, result: r });
         return;
@@ -374,11 +354,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.session.set({
           lastCandidates: {
             page_url: r.page_url || msg.url,
-            candidates: uniqueMediaItems(r.candidates || []),
+            candidates: capture.filter(r.candidates || []),
             at: Date.now(),
           },
         });
         sendResponse({ ok: true, result: r });
+        return;
+      }
+      if (msg?.type === 'getCaptureState') {
+        sendResponse({ ok: true, enabled: capture.enabled, submitted: [...capture.submitted] });
+        return;
+      }
+      if (msg?.type === 'setAutoCapture') {
+        const enabled = await capture.setEnabled(msg.enabled);
+        sendResponse({ ok: true, enabled });
         return;
       }
       if (msg?.type === 'status') {

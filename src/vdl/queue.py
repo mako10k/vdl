@@ -447,6 +447,28 @@ class JobQueue:
             ).fetchall()
             return [self._row(r) for r in rows]
 
+    def submitted_download_urls(self) -> set[str]:
+        """All submitted download URLs, including failed and archived jobs."""
+        from vdl.util import normalize_url
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM jobs WHERE kind = 'download'"
+            ).fetchall()
+        urls: set[str] = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            values = [payload.get("url")]
+            if isinstance(payload.get("urls"), list):
+                values.extend(payload["urls"])
+            urls.update(normalize_url(u) for u in values if isinstance(u, str) and u.strip())
+        return urls
+
     def active_download_urls(self) -> set[str]:
         """Normalized URLs with pending/running download jobs (for candidate dedupe)."""
         from vdl.util import normalize_url

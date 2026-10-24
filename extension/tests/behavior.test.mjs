@@ -7,25 +7,26 @@ let menuHandler;
 const opened = [];
 const requests = [];
 const session = {};
+const badges = new Map();
 const event = () => ({ addListener() {} });
 globalThis.chrome = {
-  runtime: { onInstalled: event(), onMessage: { addListener(fn) { messageHandler = fn; } } },
+  runtime: { sendMessage: async () => {}, onInstalled: event(), onMessage: { addListener(fn) { messageHandler = fn; } } },
   contextMenus: { onClicked: { addListener(fn) { menuHandler = fn; } } },
   tabs: { onRemoved: event(), onActivated: event(),
     create: async (tab) => opened.push(tab),
     sendMessage: async () => ({ items: [] }) },
-  action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
+  action: { setBadgeText: async ({ tabId, text }) => badges.set(tabId, text), setBadgeBackgroundColor: async () => {} },
   webRequest: { onCompleted: event() },
   notifications: { create() {} },
-  storage: { sync: { get: async (defaults) => defaults },
-    session: { set: async (data) => Object.assign(session, data) } },
+  storage: { local: { get: async (defaults) => defaults, set: async () => {} }, sync: { get: async (defaults) => defaults },
+    session: { get: async (defaults) => defaults, set: async (data) => Object.assign(session, data) } },
 };
 globalThis.fetch = async (url, init) => {
   const body = JSON.parse(init?.body || '{}');
   requests.push({ url, body });
   const data = url.endsWith('/api/candidates') ? {
     candidates: [{ url: 'https://example.test/a.mp4' }, { url: 'https://example.test/a.mp4#dup' }],
-  } : { jobs: [{ id: 1 }], job: { id: 1 } };
+  } : url.endsWith('/api/submitted-urls') ? { urls: [] } : { jobs: (body.urls || []).map((url) => ({ id: 1, payload: { url } })) };
   return { ok: true, status: 200, headers: new Headers({ 'Content-Type': 'application/json' }),
     json: async () => data };
 };
@@ -44,22 +45,25 @@ test('obvious duplicates collapse while signed URLs remain distinct', () => {
 
 test('detection and batch enqueue deduplicate before display and submission', async () => {
   await send({ type: 'mediaFound', items: [] });
-  messageHandler({ type: 'mediaFound', items: [
+  await new Promise((resolve) => messageHandler({ type: 'mediaFound', items: [
     { url: 'https://example.test/a.mp4#one' }, { url: 'https://example.test/a.mp4#two' },
-  ] }, { tab: { id: 1 } }, () => {});
+  ] }, { tab: { id: 1 } }, resolve));
   const detected = await send({ type: 'getDetected', tabId: 1 });
   assert.equal(detected.items.length, 1);
+  assert.equal(badges.get(1), "1");
   const response = await send({ type: 'enqueueBatch', openQueue: true,
     urls: ['https://example.test/a.mp4', 'https://example.test/a.mp4#dup'] });
   assert.equal(response.ok, true);
   assert.equal(requests.at(-1).body.urls.length, 1);
   assert.equal(opened.length, 0);
+  assert.equal((await send({ type: 'getDetected', tabId: 1 })).items.length, 0);
+  assert.equal(badges.get(1), '');
 });
 
 test('enqueue and page extraction never open the Web console', async () => {
   assert.equal((await send({ type: 'enqueue', url: 'https://example.test/a.mp4', openQueue: true })).ok, true);
   await menuHandler({ menuItemId: 'vdl-enqueue-page' }, { id: 2, url: 'https://example.test/page' });
-  assert.equal(session.lastCandidates.candidates.length, 1);
+  assert.equal(session.lastCandidates.candidates.length, 0);
   assert.equal(opened.length, 0);
   assert.equal((await send({ type: 'openConsoleQueue' })).ok, true);
   assert.equal(opened.length, 1);
