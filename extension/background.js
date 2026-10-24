@@ -64,6 +64,13 @@ async function updateBadge(tabId) {
   }
 }
 
+async function fetchCandidates(url) {
+  const result = await api.candidates(url);
+  await capture.checkSubmitted((result.candidates || []).map((m) => m.url));
+  const candidates = capture.filter(result.candidates || []);
+  return { ...result, candidates, count: candidates.length };
+}
+
 async function enqueueUrl(url, { quality } = {}) {
   if (!url || !/^https?:\/\//i.test(url)) {
     throw new Error(`http(s) URL のみ対応: ${url || '(empty)'}`);
@@ -200,7 +207,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         }
       }
       if (url) {
-        const r = await api.candidates(url);
+        const r = await fetchCandidates(url);
         const candidates = capture.filter(r.candidates || []);
         await chrome.storage.session.set({
           lastCandidates: { page_url: r.page_url || url, candidates, at: Date.now() },
@@ -221,7 +228,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       const url = tab?.url || info.pageUrl;
       if (!url) throw new Error('ページ URL がありません');
       await chrome.storage.session.set({ pendingScrapeUrl: url });
-      const r = await api.candidates(url);
+      const r = await fetchCandidates(url);
       await chrome.storage.session.set({
         lastCandidates: {
           page_url: r.page_url || url,
@@ -350,7 +357,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       if (msg?.type === 'candidates') {
-        const r = await api.candidates(msg.url);
+        const r = await fetchCandidates(msg.url);
         await chrome.storage.session.set({
           lastCandidates: {
             page_url: r.page_url || msg.url,

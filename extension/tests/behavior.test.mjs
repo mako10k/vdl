@@ -69,3 +69,11 @@ test('enqueue and page extraction never open the Web console', async () => {
   assert.equal(opened.length, 1);
   assert.match(opened[0].url, /tab=queue/);
 });
+
+
+test('server candidates also hide previously submitted URLs', async () => {
+  const result = await send({ type: 'candidates', url: 'https://example.test/page' });
+  assert.equal(result.ok, true);
+  assert.equal(result.result.candidates.length, 0);
+  assert.equal(result.result.count, 0);
+});
