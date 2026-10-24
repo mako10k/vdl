@@ -278,6 +278,9 @@ def download_m3u8_ffmpeg(
     name = safe_filename(name)
     out_path = unique_path(dest_dir, name)
 
+    from vdl.execution import track_partial
+    track_partial(out_path)
+
     # Build ffmpeg headers string (CRLF separated)
     header_args: list[str] = []
     if headers:

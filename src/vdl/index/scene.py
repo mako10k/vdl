@@ -101,6 +101,9 @@ def detect_scenes(
 def extract_frame(video_path: Path, time_sec: float, out_path: Path) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not out_path.exists():
+        from vdl.execution import track_partial
+        track_partial(out_path)
     cmd = [
         "ffmpeg",
         "-y",

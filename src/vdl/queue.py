@@ -695,7 +695,7 @@ class JobQueue:
                 # last chance right at archive age if not yet housekeep-retried
                 last_chance = age >= max(0.0, archive_after_minutes) and hk == 0
                 # Single extra attempt only: do not reset full attempt budget
-                under_cap = int(job.attempts or 0) < max_att + 1
+                under_cap = int(job.attempts or 0) < max_att
                 if retryable and hk == 0 and under_cap and (cool or last_chance):
                     with self._conn() as conn:
                         conn.execute(
@@ -703,6 +703,10 @@ class JobQueue:
                             UPDATE jobs SET
                                 status = 'pending',
                                 housekeep_retried = 1,
+                                priority = MIN(priority - 10, COALESCE((
+                                    SELECT MIN(priority) - 1 FROM jobs
+                                    WHERE status='pending' AND kind != 'daemon_reload'
+                                ), priority - 10)),
                                 error = ?,
                                 result_json = NULL,
                                 started_at = NULL,
@@ -740,7 +744,7 @@ class JobQueue:
                     continue
 
             if age >= max(0.0, archive_after_minutes):
-                if job.status == "failed" and auto_retry and hk == 0 and is_retryable_error(
+                if job.status == "failed" and auto_retry and hk == 0 and job.attempts < max_att and is_retryable_error(
                     job.error, kind=job.kind
                 ):
                     continue
@@ -933,7 +937,7 @@ class JobQueue:
             cancelled.extend(more)
         return cancelled
 
-    def claim_next(self, *, kinds: set[str] | None = None) -> Optional[Job]:
+    def claim_next(self, *, kinds: set[str] | None = None, allow_reload: bool = True) -> Optional[Job]:
         """
         Atomically claim highest-priority runnable job.
         Runnable = pending AND (no dependency OR dependency is done).
@@ -975,6 +979,8 @@ class JobQueue:
                         )
             """
             if gate is not None:
+                if not allow_reload:
+                    return None
                 if gate["status"] == "running":
                     # Reload already in progress — do not claim anything else.
                     return None
@@ -1001,6 +1007,15 @@ class JobQueue:
                     WHERE j.status = 'pending'
                       AND ({dep_ok})
                       {kind_filter}
+                      AND NOT EXISTS (
+                        SELECT 1 FROM jobs r WHERE r.status='running' AND (
+                          (j.download_id IS NOT NULL AND r.download_id=j.download_id)
+                          OR (j.kind != 'download' AND r.kind != 'download' AND (
+                            j.kind IN ('dedup', 'ts_to_mp4') OR r.kind IN ('dedup', 'ts_to_mp4')
+                            OR (j.kind IN ('clip_optimize', 'embed') AND r.kind IN ('clip_optimize', 'embed'))
+                          ))
+                        )
+                      )
                     ORDER BY j.priority DESC, j.id ASC
                     LIMIT 1
                     """,
@@ -1124,7 +1139,7 @@ class JobQueue:
                     progress_pct = 100,
                     progress_msg = 'done',
                     eta_sec = 0
-                WHERE id = ?
+                WHERE id = ? AND status NOT IN ('cancelled', 'failed', 'archived')
                 """,
                 (
                     json.dumps(result or {}, ensure_ascii=False),
@@ -1251,6 +1266,7 @@ class JobQueue:
         max_att = max(1, int(max_attempts if max_attempts is not None else JOB_MAX_ATTEMPTS))
         now = _utc_now()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
@@ -1260,7 +1276,13 @@ class JobQueue:
             attempts = prev_attempts + 1
             err_text = (error or "unknown error")[:2000]
 
+            if row["status"] in ("done", "cancelled", "archived"):
+                return self._row(row)
             if attempts < max_att:
+                tail = conn.execute(
+                    "SELECT MIN(priority) FROM jobs WHERE status='pending' AND kind != 'daemon_reload'"
+                ).fetchone()[0]
+                priority = min(int(row["priority"]) - 10, int(tail) - 1 if tail is not None else int(row["priority"]) - 10)
                 # Auto-retry: back to pending for another claim
                 msg = f"retry {attempts}/{max_att - 1}: {err_text[:120]}"
                 conn.execute(
@@ -1268,6 +1290,7 @@ class JobQueue:
                     UPDATE jobs SET
                         status = 'pending',
                         attempts = ?,
+                        priority = ?,
                         error = ?,
                         result_json = NULL,
                         started_at = NULL,
@@ -1278,7 +1301,7 @@ class JobQueue:
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (attempts, err_text, msg, now, job_id),
+                    (attempts, priority, err_text, msg, now, job_id),
                 )
                 out = conn.execute(
                     "SELECT * FROM jobs WHERE id = ?", (job_id,)

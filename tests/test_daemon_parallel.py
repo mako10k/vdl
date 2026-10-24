@@ -39,7 +39,7 @@ def test_parallel_claims_three_independent_jobs(tmp_path: Path, monkeypatch) -> 
             active -= 1
         return {"ok": True, "id": job.id}
 
-    monkeypatch.setattr("vdl.daemon.run_job", fake_run_job)
+    monkeypatch.setattr("vdl.daemon.run_isolated", fake_run_job)
 
     run_forever(
         cfg,
@@ -92,9 +92,24 @@ def test_reserved_lanes_and_dependencies(tmp_path, monkeypatch, workers, saturat
             active[lane] -= 1
         return {}
 
-    monkeypatch.setattr("vdl.daemon.run_job", fake_run_job)
+    monkeypatch.setattr("vdl.daemon.run_isolated", fake_run_job)
     run_forever(cfg, workers=workers, poll_interval=0.01,
                 foreground=False, idle_sec=0.02)
     assert all(j.status == "done" for j in q.list_jobs(limit=20))
     assert 1 <= maxima["download"] <= download_slots
     assert maxima["processing"] == 1
+
+
+def test_auxiliary_jobs_borrow_all_idle_download_slots(tmp_path, monkeypatch):
+    cfg = Config(home=tmp_path)
+    cfg.daemon_auto_reload = False
+    q = JobQueue(cfg.db_path)
+    for _ in range(4):
+        q.enqueue(JobKind.SCENE_DETECT, priority=40)
+    barrier = threading.Barrier(4)
+    def execute(config, job):
+        barrier.wait(timeout=3)
+        return {}
+    monkeypatch.setattr('vdl.daemon.run_isolated', execute)
+    run_forever(cfg, workers=4, foreground=False, idle_sec=.02, poll_interval=.01)
+    assert all(j.status == 'done' for j in q.list_jobs(limit=10))

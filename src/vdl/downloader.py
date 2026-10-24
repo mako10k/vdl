@@ -72,6 +72,8 @@ def download_file(
             name = name + ext_map.get(ct, ".bin")
 
         out_path = unique_path(dest_dir, name)
+        from vdl.execution import track_partial
+        track_partial(out_path)
         total = resp.headers.get("content-length")
         total_n: int | None = int(total) if total and total.isdigit() else None
 

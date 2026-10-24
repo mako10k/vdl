@@ -153,6 +153,9 @@ def select_keyframe_for_scene(
     best = int(np.argmax(sims))
     key_path = work_dir / f"scene{scene_index:04d}_key.jpg"
     # copy best candidate as key
+    if not key_path.exists():
+        from vdl.execution import track_partial
+        track_partial(key_path)
     key_path.write_bytes(paths[best].read_bytes())
     return {
         "keyframe_path": str(key_path),

@@ -15,6 +15,7 @@ from vdl.config import DAEMON_IDLE_SEC, DAEMON_WORKERS, Config
 from vdl.queue import Job, JobKind, JobQueue
 from vdl.reload import ensure_reload_if_stale, package_fingerprint, reexec_daemon
 from vdl.workers import DaemonReloadRequested, run_job
+from vdl.execution import run_isolated, recover_attempts
 
 
 class DaemonState:
@@ -42,6 +43,9 @@ def _setup_logging(log_path: Path | None, *, foreground: bool) -> logging.Logger
 def pid_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists() and stat.read_text().split(") ", 1)[1].split()[0] == "Z":
+            return False
         return True
     except OSError:
         return False
@@ -102,9 +106,9 @@ def _execute_job(config: Config, job: Job) -> tuple[int, str, str | None, dict |
     queue = JobQueue(config.db_path)
     max_attempts = int(getattr(config, "job_max_attempts", 3) or 3)
     try:
-        result = run_job(config, job)
-        queue.mark_done(job.id, result)
-        return job.id, "done", None, result
+        result = run_isolated(config, job)
+        completed = queue.mark_done(job.id, result)
+        return job.id, completed.status, None, result
     except DaemonReloadRequested as e:
         # Should only happen on main thread; treat as special.
         return job.id, "reload", None, e.result
@@ -131,8 +135,8 @@ def run_forever(
 ) -> None:
     """
     Worker loop with a thread pool.
-    At job boundaries (no in-flight work), may enqueue a daemon_reload gate
-    if package code changed, then re-exec when that job is claimed.
+    On package changes, enqueue a reload gate and drain bounded attempts
+    before re-exec.
     """
     config.ensure_dirs()
     if idle_sec is None:
@@ -153,6 +157,12 @@ def run_forever(
     )
     state = DaemonState()
     queue = JobQueue(config.db_path)
+
+    for job_id in recover_attempts(config):
+        job = queue.get(job_id)
+        if job and job.status == 'running':
+            queue.mark_failed(job_id, 'attempt interrupted by daemon restart',
+                              max_attempts=config.job_max_attempts)
 
     # Recover jobs left "running" by previous process death / re-exec.
     reclaimed = queue.reclaim_stale_running()
@@ -211,9 +221,7 @@ def run_forever(
                     pass
 
     def _maybe_schedule_reload() -> None:
-        """Only at true job boundary (no in-flight futures)."""
-        if futures:
-            return
+        """Enqueue a gate while busy, then drain active work before re-exec."""
         ensure_reload_if_stale(
             config, queue, started_fingerprint=started_fp, logger=logger
         )
@@ -291,8 +299,7 @@ def run_forever(
                     last_housekeep = now_m
 
                 # Job boundary: consider self-update gate
-                if not futures:
-                    _maybe_schedule_reload()
+                _maybe_schedule_reload()
 
                 # Fill free slots — but if reload is active, only claim that
                 # (and only when no other work is in-flight).
@@ -315,13 +322,11 @@ def run_forever(
                     downloads_active = sum(
                         j.kind == JobKind.DOWNLOAD.value for j in futures.values()
                     )
-                    processing_active = len(futures) - downloads_active
-                    kinds = set()
+                    job = None
                     if downloads_active < download_workers:
-                        kinds.add(JobKind.DOWNLOAD.value)
-                    if processing_active < 1:
-                        kinds.update(processing_kinds)
-                    job = queue.claim_next(kinds=kinds)
+                        job = queue.claim_next(kinds={JobKind.DOWNLOAD.value}, allow_reload=not futures)
+                    if job is None:
+                        job = queue.claim_next(kinds=processing_kinds, allow_reload=not futures)
                     if not job:
                         break
                     claimed_any = True

@@ -70,7 +70,9 @@ def _drop_index(config: Config, queue: JobQueue, download_id: int) -> None:
         shutil.rmtree(kdir, ignore_errors=True)
 
 
-def remux_ts_to_mp4(src: Path, *, ffmpeg_bin: str = "ffmpeg") -> Path:
+def remux_ts_to_mp4(
+    src: Path, *, ffmpeg_bin: str = "ffmpeg", remove_source: bool = True
+) -> Path:
     """Remux MPEG-TS to MP4 (stream copy). Deletes src on success."""
     src = Path(src)
     if not src.is_file():
@@ -87,6 +89,8 @@ def remux_ts_to_mp4(src: Path, *, ffmpeg_bin: str = "ffmpeg") -> Path:
         dest = unique_path(dest.parent, dest.name)
     tmp = dest.with_name(f"{dest.stem}.{uuid.uuid4().hex[:8]}.remux-tmp.mp4")
     tmp.unlink(missing_ok=True)
+    from vdl.execution import track_partial
+    track_partial(tmp)
 
     def _run(extra: list[str]) -> None:
         cmd = [
@@ -118,8 +122,10 @@ def remux_ts_to_mp4(src: Path, *, ffmpeg_bin: str = "ffmpeg") -> Path:
         if not tmp.is_file() or tmp.stat().st_size == 0:
             tmp.unlink(missing_ok=True)
             raise RuntimeError("remux produced an empty file")
+        track_partial(dest)
         tmp.replace(dest)
-        src.unlink(missing_ok=True)
+        if remove_source:
+            src.unlink(missing_ok=True)
         return dest
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -172,7 +178,7 @@ def run_ts_to_mp4(
             continue
         try:
             src_hash = rec.file_hash or sha256_file(src)
-            dest = remux_ts_to_mp4(src)
+            dest = remux_ts_to_mp4(src, remove_source=False)
             dest_hash = sha256_file(dest)
             title = rec.title
             if title and title.lower().endswith(".ts"):
@@ -189,6 +195,7 @@ def run_ts_to_mp4(
                 title=title,
                 meta_update=meta_update,
             )
+            src.unlink(missing_ok=True)
             converted.append(
                 {
                     "download_id": rec.id,

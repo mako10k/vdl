@@ -236,6 +236,8 @@ class Registry:
                 ),
             )
             row_id = cur.lastrowid
+            from vdl.execution import track_record
+            track_record(row_id)
             row = conn.execute("SELECT * FROM downloads WHERE id = ?", (row_id,)).fetchone()
             assert row is not None
             return self._row_to_record(row)

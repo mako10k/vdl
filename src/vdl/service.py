@@ -319,6 +319,8 @@ class DownloadService:
         )
         try:
             dest = unique_path(self.config.download_dir, path.name)
+            from vdl.execution import track_partial
+            track_partial(dest)
             shutil.copy2(path, dest)
             digest = sha256_file(dest)
             size = dest.stat().st_size
