@@ -139,6 +139,13 @@ def run_forever(
     before re-exec.
     """
     config.ensure_dirs()
+    import fcntl
+    lock = config.daemon_pid_path.with_suffix(".lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise RuntimeError("daemon already running (worker lock held)")
     if idle_sec is None:
         idle_sec = float(getattr(config, "daemon_idle_sec", DAEMON_IDLE_SEC))
     max_workers = int(
@@ -399,6 +406,7 @@ def run_forever(
         if write_pid_file:
             remove_pid(config.daemon_pid_path)
         logger.info("daemon stopped")
+        lock.close()
 
 
 def start_background(
