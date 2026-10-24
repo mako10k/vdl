@@ -94,3 +94,16 @@ def test_restart_reaps_orphaned_attempt_before_reclaim(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_concurrent_attempts_cannot_overwrite_each_others_partial_outputs(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from vdl.util import reserve_path
+    def write(number):
+        path = reserve_path(tmp_path, 'same.mp4')
+        path.write_text(str(number))
+        return path
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(write, range(20)))
+    assert len(set(paths)) == 20
+    assert {p.read_text() for p in paths} == {str(i) for i in range(20)}

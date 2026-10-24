@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vdl.util import reserve_path
+
 import json
 import shutil
 import subprocess
@@ -14,7 +16,7 @@ from urllib.request import pathname2url
 import httpx
 import m3u8
 
-from vdl.util import is_mpd_url, safe_filename, sha256_text, unique_path
+from vdl.util import is_mpd_url, safe_filename, sha256_text
 
 # out_time_sec, duration_hint_or_None
 FFmpegProgressCb = Callable[[float, Optional[float]], None]
@@ -276,7 +278,7 @@ def download_m3u8_ffmpeg(
     if not name.lower().endswith((".mp4", ".mkv", ".ts", ".m4v")):
         name = name + ".mp4"
     name = safe_filename(name)
-    out_path = unique_path(dest_dir, name)
+    out_path = reserve_path(dest_dir, name)
 
     from vdl.execution import track_partial
     track_partial(out_path)
@@ -361,8 +363,8 @@ def download_m3u8_ffmpeg(
     try:
         _run(with_bsf=True)
     except subprocess.CalledProcessError:
-        if out_path.exists():
-            out_path.unlink(missing_ok=True)
+        # Retain our reservation while retrying, so another attempt cannot claim it.
+        out_path.write_bytes(b"")
         _run(with_bsf=False)
 
     if on_progress and duration_hint:

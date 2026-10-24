@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vdl.util import reserve_path
+
 import os
 import sys
 from dataclasses import dataclass
@@ -295,7 +297,6 @@ class DownloadService:
     def _handle_local_video(self, path: Path, *, original: str) -> ActionResult:
         import shutil
 
-        from vdl.util import unique_path
 
         canonical = normalize_url(path.as_uri())
         existing = self.registry.is_downloaded(canonical)
@@ -318,7 +319,7 @@ class DownloadService:
             title=path.name,
         )
         try:
-            dest = unique_path(self.config.download_dir, path.name)
+            dest = reserve_path(self.config.download_dir, path.name)
             from vdl.execution import track_partial
             track_partial(dest)
             shutil.copy2(path, dest)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vdl.util import reserve_path
+
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -15,7 +17,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from vdl.util import filename_from_url, safe_filename, sha256_file, unique_path
+from vdl.util import filename_from_url, safe_filename, sha256_file
 
 
 ProgressCallback = Callable[[int, int | None], None]
@@ -71,7 +73,7 @@ def download_file(
             }
             name = name + ext_map.get(ct, ".bin")
 
-        out_path = unique_path(dest_dir, name)
+        out_path = reserve_path(dest_dir, name)
         from vdl.execution import track_partial
         track_partial(out_path)
         total = resp.headers.get("content-length")

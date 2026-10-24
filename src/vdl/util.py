@@ -239,3 +239,15 @@ def unique_path(directory: Path, filename: str) -> Path:
         if not alt.exists():
             return alt
         n += 1
+
+
+def reserve_path(directory: Path, filename: str) -> Path:
+    """Atomically reserve a fresh output, including across worker processes."""
+    while True:
+        path = unique_path(directory, filename)
+        try:
+            with path.open('xb'):
+                pass
+            return path
+        except FileExistsError:
+            continue
